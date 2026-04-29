@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/clbanning/mxj/v2"
 	"github.com/sjzar/chatlog/internal/wechat"
 	_ "modernc.org/sqlite"
 )
@@ -35,7 +34,24 @@ type FavItemXML struct {
 	} `xml:"datalist"`
 	Source struct {
 		FromUser string `xml:"fromusr"`
+		Link     string `xml:"link"`
 	} `xml:"source"`
+}
+
+// FavoriteSchema matches the data/favorites.schema.json
+type FavoriteSchema struct {
+	FavLocalID int         `json:"FavLocalID"`
+	URL        string      `json:"url"`
+	PageTitle  string      `json:"pagetitle"`
+	Content    string      `json:"content"`
+	SearchKey  string      `json:"SearchKey"`
+	Tags       []string    `json:"tags"`
+	Source     FavSource   `json:"source"`
+}
+
+type FavSource struct {
+	FromUsr string `json:"fromusr"`
+	Link    string `json:"link"`
 }
 
 func main() {
@@ -98,56 +114,58 @@ func exportJSON(dbPath, outPath string) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query("SELECT * FROM FavItems ORDER BY UpdateTime DESC")
+	rows, err := db.Query("SELECT FavLocalID, XmlBuf FROM FavItems ORDER BY UpdateTime DESC")
 	if err != nil {
 		log.Printf("JSON Export Query Error: %v", err)
 		return
 	}
 	defer rows.Close()
 
-	columns, err := rows.Columns()
-	if err != nil {
-		log.Printf("JSON Export Columns Error: %v", err)
-		return
-	}
-
-	var allFavorites []map[string]interface{}
+	var allFavorites []FavoriteSchema
 
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range columns {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
+		var id int
+		var xmlBuf string
+		if err := rows.Scan(&id, &xmlBuf); err != nil {
 			log.Printf("JSON Export Scan Error: %v", err)
 			return
 		}
 
-		rowMap := make(map[string]interface{})
-		for i, col := range columns {
-			val := values[i]
-			if b, ok := val.([]byte); ok {
-				rowMap[col] = string(b)
-			} else {
-				rowMap[col] = val
-			}
+		var item FavItemXML
+		_ = xml.Unmarshal([]byte(xmlBuf), &item)
+
+		url := item.WebURLItem.Link
+		if url == "" {
+			url = item.Source.Link
 		}
 
-		if xmlBuf, ok := rowMap["XmlBuf"].(string); ok && xmlBuf != "" {
-			m, err := mxj.NewMapXml([]byte(xmlBuf))
-			if err == nil {
-				rowMap["XmlData"] = m
-			} else {
-				rowMap["XmlData"] = map[string]interface{}{
-					"error": "Failed to parse XML",
-					"raw":   xmlBuf,
-				}
-			}
+		pageTitle := item.WebURLItem.PageTitle
+		if pageTitle == "" {
+			pageTitle = item.Title
+		}
+		if pageTitle == "" && len(item.DataList.DataItems) > 0 {
+			pageTitle = item.DataList.DataItems[0].DataTitle
 		}
 
-		allFavorites = append(allFavorites, rowMap)
+		content := item.Desc
+		if content == "" {
+			content = ""
+		}
+
+		fav := FavoriteSchema{
+			FavLocalID: id,
+			URL:        url,
+			PageTitle:  pageTitle,
+			Content:    content,
+			SearchKey:  "",
+			Tags:       []string{}, // Ensure it outputs `[]` instead of `null`
+			Source: FavSource{
+				FromUsr: item.Source.FromUser,
+				Link:    item.Source.Link,
+			},
+		}
+
+		allFavorites = append(allFavorites, fav)
 	}
 
 	file, err := os.Create(outPath)
@@ -159,12 +177,13 @@ func exportJSON(dbPath, outPath string) {
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(allFavorites); err != nil {
 		log.Printf("JSON Export Encode Error: %v", err)
 		return
 	}
 
-	fmt.Printf("Exported %d favorites with all fields to %s\n", len(allFavorites), outPath)
+	fmt.Printf("Exported %d favorites strictly matching the JSON schema to %s\n", len(allFavorites), outPath)
 }
 
 func exportMD(dbPath, outPath string) {
