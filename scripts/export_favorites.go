@@ -114,7 +114,19 @@ func exportJSON(dbPath, outPath string) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query("SELECT FavLocalID, XmlBuf FROM FavItems ORDER BY UpdateTime DESC")
+	query := `
+		SELECT 
+			f.FavLocalID, 
+			f.SearchKey,
+			f.XmlBuf,
+			GROUP_CONCAT(t.Tag, '|||') AS tags
+		FROM FavItems f
+		LEFT JOIN FavTags t ON f.FavLocalID = t.FavLocalID
+		GROUP BY f.FavLocalID
+		ORDER BY f.UpdateTime DESC
+	`
+
+	rows, err := db.Query(query)
 	if err != nil {
 		log.Printf("JSON Export Query Error: %v", err)
 		return
@@ -125,14 +137,17 @@ func exportJSON(dbPath, outPath string) {
 
 	for rows.Next() {
 		var id int
-		var xmlBuf string
-		if err := rows.Scan(&id, &xmlBuf); err != nil {
+		var searchKey sql.NullString
+		var xmlBuf sql.NullString
+		var tagsStr sql.NullString
+
+		if err := rows.Scan(&id, &searchKey, &xmlBuf, &tagsStr); err != nil {
 			log.Printf("JSON Export Scan Error: %v", err)
 			return
 		}
 
 		var item FavItemXML
-		_ = xml.Unmarshal([]byte(xmlBuf), &item)
+		_ = xml.Unmarshal([]byte(xmlBuf.String), &item)
 
 		url := item.WebURLItem.Link
 		if url == "" {
@@ -152,13 +167,18 @@ func exportJSON(dbPath, outPath string) {
 			content = ""
 		}
 
+		tags := []string{}
+		if tagsStr.Valid && tagsStr.String != "" {
+			tags = strings.Split(tagsStr.String, "|||")
+		}
+
 		fav := FavoriteSchema{
 			FavLocalID: id,
 			URL:        url,
 			PageTitle:  pageTitle,
 			Content:    content,
-			SearchKey:  "",
-			Tags:       []string{}, // Ensure it outputs `[]` instead of `null`
+			SearchKey:  searchKey.String,
+			Tags:       tags,
 			Source: FavSource{
 				FromUsr: item.Source.FromUser,
 				Link:    item.Source.Link,
@@ -194,7 +214,19 @@ func exportMD(dbPath, outPath string) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query("SELECT FavLocalID, Type, UpdateTime, XmlBuf FROM FavItems ORDER BY UpdateTime DESC")
+	query := `
+		SELECT 
+			f.FavLocalID, 
+			f.Type, 
+			f.UpdateTime, 
+			f.XmlBuf,
+			GROUP_CONCAT(t.Tag, ', ') AS tags
+		FROM FavItems f
+		LEFT JOIN FavTags t ON f.FavLocalID = t.FavLocalID
+		GROUP BY f.FavLocalID
+		ORDER BY f.UpdateTime DESC
+	`
+	rows, err := db.Query(query)
 	if err != nil {
 		log.Printf("MD Export Query Error: %v", err)
 		return
@@ -215,11 +247,12 @@ func exportMD(dbPath, outPath string) {
 		var id int
 		var typ int
 		var utime int
-		var xmlBuf string
-		rows.Scan(&id, &typ, &utime, &xmlBuf)
+		var xmlBuf sql.NullString
+		var tagsStr sql.NullString
+		rows.Scan(&id, &typ, &utime, &xmlBuf, &tagsStr)
 
 		var item FavItemXML
-		_ = xml.Unmarshal([]byte(xmlBuf), &item)
+		_ = xml.Unmarshal([]byte(xmlBuf.String), &item)
 
 		t := time.Unix(int64(utime), 0).Format("2006-01-02 15:04:05")
 
@@ -261,6 +294,9 @@ func exportMD(dbPath, outPath string) {
 
 		file.WriteString(fmt.Sprintf("## %s\n", title))
 		file.WriteString(fmt.Sprintf("- **Date:** %s\n", t))
+		if tagsStr.Valid && tagsStr.String != "" {
+			file.WriteString(fmt.Sprintf("- **Tags:** %s\n", tagsStr.String))
+		}
 		if item.Source.FromUser != "" {
 			file.WriteString(fmt.Sprintf("- **From:** %s\n", item.Source.FromUser))
 		}
