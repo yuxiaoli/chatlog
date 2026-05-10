@@ -1,0 +1,1 @@
+uv run scripts/wechat_db.py --ui web

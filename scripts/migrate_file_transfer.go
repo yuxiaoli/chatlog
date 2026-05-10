@@ -99,7 +99,7 @@ func main() {
 		log.Fatalf("Encode JSON failed: %v", err)
 	}
 
-	fmt.Printf("Successfully exported %d messages to %s\n", len(allMessages), outPath)
+	fmt.Printf("Successfully exported %d messages to JSON at %s\n", len(allMessages), outPath)
 }
 
 func queryFileHelper(dbPath string, version int) []FileTransferMsg {

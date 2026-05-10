@@ -1,0 +1,12 @@
+[project]
+name = "scripts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "blackboxprotobuf>=1.0.1",
+    "duckdb>=1.5.2",
+    "requests>=2.33.1",
+    "tqdm>=4.67.3",
+]
