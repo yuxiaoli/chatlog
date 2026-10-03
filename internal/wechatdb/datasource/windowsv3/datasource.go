@@ -2,6 +2,7 @@ package windowsv3
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"regexp"
@@ -406,17 +407,32 @@ func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.T
 
 // GetContacts 实现获取联系人信息的方法
 func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset int) ([]*model.Contact, error) {
+	db, err := ds.dbm.GetDB(Contact)
+	if err != nil {
+		return nil, err
+	}
+	labelNames, err := loadContactLabelNames(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+
 	var query string
 	var args []interface{}
 
 	if key != "" {
 		// 按照关键字查询
-		query = `SELECT UserName, Alias, Remark, NickName, Reserved1 FROM Contact 
-                WHERE UserName = ? OR Alias = ? OR Remark = ? OR NickName = ?`
-		args = []interface{}{key, key, key, key}
+		conditions := []string{"UserName = ?", "Alias = ?", "Remark = ?", "NickName = ?", "Reserved6 = ?"}
+		args = []interface{}{key, key, key, key, key}
+		for _, id := range contactLabelIDsForKey(key, labelNames) {
+			conditions = append(conditions,
+				`instr(',' || replace(IFNULL(LabelIDList, ''), ' ', '') || ',', ',' || ? || ',') > 0`)
+			args = append(args, id)
+		}
+		query = `SELECT UserName, Alias, Remark, NickName, Reserved1, IFNULL(Reserved6, ''), IFNULL(LabelIDList, ''), IFNULL(ExtraBuf, X'') FROM Contact WHERE ` +
+			strings.Join(conditions, " OR ")
 	} else {
 		// 查询所有联系人
-		query = `SELECT UserName, Alias, Remark, NickName, Reserved1 FROM Contact`
+		query = `SELECT UserName, Alias, Remark, NickName, Reserved1, IFNULL(Reserved6, ''), IFNULL(LabelIDList, ''), IFNULL(ExtraBuf, X'') FROM Contact`
 	}
 
 	// 添加排序、分页
@@ -428,11 +444,6 @@ func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset
 		}
 	}
 
-	// 执行查询
-	db, err := ds.dbm.GetDB(Contact)
-	if err != nil {
-		return nil, err
-	}
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, errors.QueryFailed(query, err)
@@ -448,16 +459,83 @@ func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset
 			&contactV3.Remark,
 			&contactV3.NickName,
 			&contactV3.Reserved1,
+			&contactV3.Reserved6,
+			&contactV3.LabelIDList,
+			&contactV3.ExtraBuf,
 		)
 
 		if err != nil {
 			return nil, errors.ScanRowFailed(err)
 		}
 
-		contacts = append(contacts, contactV3.Wrap())
+		contacts = append(contacts, contactV3.WrapWithLabelNames(labelNames))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.ScanRowFailed(err)
 	}
 
 	return contacts, nil
+}
+
+func contactLabelIDsForKey(key string, labelNames map[string]string) []string {
+	ids := make([]string, 0)
+	seen := make(map[string]struct{})
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	add(key)
+	for id, name := range labelNames {
+		if name == key {
+			add(id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func loadContactLabelNames(ctx context.Context, db *sql.DB) (map[string]string, error) {
+	const query = `SELECT IFNULL(CAST(LabelId AS TEXT), ''), IFNULL(LabelName, '') FROM ContactLabel ORDER BY rowid`
+	labelNames := make(map[string]string)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		// Some older Windows v3 databases do not contain the definition table.
+		// Contact.LabelIDList is still exported as unresolved IDs in that case.
+		if strings.Contains(err.Error(), "no such table") {
+			return labelNames, nil
+		}
+		return nil, errors.QueryFailed(query, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, errors.ScanRowFailed(err)
+		}
+		id = strings.TrimSpace(id)
+		if id != "" {
+			if _, exists := labelNames[id]; exists {
+				// LabelId is documented as unique. Treat corrupt duplicates as
+				// ambiguous instead of silently choosing one definition.
+				labelNames[id] = ""
+			} else {
+				labelNames[id] = name
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.ScanRowFailed(err)
+	}
+	return labelNames, nil
 }
 
 // GetChatRooms 实现获取群聊信息的方法

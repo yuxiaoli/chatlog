@@ -370,13 +370,13 @@ func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset
 
 	if key != "" {
 		// 按照关键字查询
-		query = `SELECT username, local_type, alias, remark, nick_name 
-				FROM contact 
-				WHERE username = ? OR alias = ? OR remark = ? OR nick_name = ?`
-		args = []interface{}{key, key, key, key}
+		query = `SELECT username, local_type, alias, remark, nick_name, IFNULL(description, '')
+				FROM contact
+				WHERE username = ? OR alias = ? OR remark = ? OR nick_name = ? OR description = ?`
+		args = []interface{}{key, key, key, key, key}
 	} else {
 		// 查询所有联系人
-		query = `SELECT username, local_type, alias, remark, nick_name FROM contact`
+		query = `SELECT username, local_type, alias, remark, nick_name, IFNULL(description, '') FROM contact`
 	}
 
 	// 添加排序、分页
@@ -408,6 +408,7 @@ func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset
 			&contactV4.Alias,
 			&contactV4.Remark,
 			&contactV4.NickName,
+			&contactV4.Description,
 		)
 
 		if err != nil {

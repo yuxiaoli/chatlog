@@ -44,10 +44,19 @@ type ContactDarwinV3 struct {
 
 func (c *ContactDarwinV3) Wrap() *Contact {
 	return &Contact{
-		UserName: c.M_nsUsrName,
-		Alias:    c.M_nsAliasName,
-		Remark:   c.M_nsRemark,
-		NickName: c.Nickname,
-		IsFriend: true,
+		UserName:       c.M_nsUsrName,
+		Alias:          c.M_nsAliasName,
+		Remark:         c.M_nsRemark,
+		NickName:       c.Nickname,
+		IsFriend:       true,
+		Description:    "",
+		Tags:           make([]ContactTag, 0),
+		Signature:      "",
+		AddScene:       nil,
+		AddSceneEnum:   "",
+		AddSceneString: "",
+		Country:        "",
+		Province:       "",
+		City:           "",
 	}
 }

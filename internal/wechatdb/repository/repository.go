@@ -16,15 +16,32 @@ type Repository struct {
 	ds datasource.DataSource
 
 	// Cache for contact
-	contactCache      map[string]*model.Contact
-	aliasToContact    map[string][]*model.Contact
-	remarkToContact   map[string][]*model.Contact
-	nickNameToContact map[string][]*model.Contact
-	chatRoomInContact map[string]*model.Contact
-	contactList       []string
-	aliasList         []string
-	remarkList        []string
-	nickNameList      []string
+	contactCache            map[string]*model.Contact
+	aliasToContact          map[string][]*model.Contact
+	remarkToContact         map[string][]*model.Contact
+	nickNameToContact       map[string][]*model.Contact
+	descriptionToContact    map[string][]*model.Contact
+	signatureToContact      map[string][]*model.Contact
+	addSceneEnumToContact   map[string][]*model.Contact
+	addSceneStringToContact map[string][]*model.Contact
+	countryToContact        map[string][]*model.Contact
+	provinceToContact       map[string][]*model.Contact
+	cityToContact           map[string][]*model.Contact
+	tagIDToContact          map[string][]*model.Contact
+	tagNameToContact        map[string][]*model.Contact
+	chatRoomInContact       map[string]*model.Contact
+	contactList             []string
+	aliasList               []string
+	remarkList              []string
+	nickNameList            []string
+	descriptionList         []string
+	signatureList           []string
+	addSceneEnumList        []string
+	addSceneStringList      []string
+	countryList             []string
+	provinceList            []string
+	cityList                []string
+	tagNameList             []string
 
 	// Cache for chat room
 	chatRoomCache      map[string]*model.ChatRoom
@@ -41,22 +58,39 @@ type Repository struct {
 // New 创建一个新的 Repository
 func New(ds datasource.DataSource) (*Repository, error) {
 	r := &Repository{
-		ds:                 ds,
-		contactCache:       make(map[string]*model.Contact),
-		aliasToContact:     make(map[string][]*model.Contact),
-		remarkToContact:    make(map[string][]*model.Contact),
-		nickNameToContact:  make(map[string][]*model.Contact),
-		chatRoomUserToInfo: make(map[string]*model.Contact),
-		contactList:        make([]string, 0),
-		aliasList:          make([]string, 0),
-		remarkList:         make([]string, 0),
-		nickNameList:       make([]string, 0),
-		chatRoomCache:      make(map[string]*model.ChatRoom),
-		remarkToChatRoom:   make(map[string][]*model.ChatRoom),
-		nickNameToChatRoom: make(map[string][]*model.ChatRoom),
-		chatRoomList:       make([]string, 0),
-		chatRoomRemark:     make([]string, 0),
-		chatRoomNickName:   make([]string, 0),
+		ds:                      ds,
+		contactCache:            make(map[string]*model.Contact),
+		aliasToContact:          make(map[string][]*model.Contact),
+		remarkToContact:         make(map[string][]*model.Contact),
+		nickNameToContact:       make(map[string][]*model.Contact),
+		descriptionToContact:    make(map[string][]*model.Contact),
+		signatureToContact:      make(map[string][]*model.Contact),
+		addSceneEnumToContact:   make(map[string][]*model.Contact),
+		addSceneStringToContact: make(map[string][]*model.Contact),
+		countryToContact:        make(map[string][]*model.Contact),
+		provinceToContact:       make(map[string][]*model.Contact),
+		cityToContact:           make(map[string][]*model.Contact),
+		tagIDToContact:          make(map[string][]*model.Contact),
+		tagNameToContact:        make(map[string][]*model.Contact),
+		chatRoomUserToInfo:      make(map[string]*model.Contact),
+		contactList:             make([]string, 0),
+		aliasList:               make([]string, 0),
+		remarkList:              make([]string, 0),
+		nickNameList:            make([]string, 0),
+		descriptionList:         make([]string, 0),
+		signatureList:           make([]string, 0),
+		addSceneEnumList:        make([]string, 0),
+		addSceneStringList:      make([]string, 0),
+		countryList:             make([]string, 0),
+		provinceList:            make([]string, 0),
+		cityList:                make([]string, 0),
+		tagNameList:             make([]string, 0),
+		chatRoomCache:           make(map[string]*model.ChatRoom),
+		remarkToChatRoom:        make(map[string][]*model.ChatRoom),
+		nickNameToChatRoom:      make(map[string][]*model.ChatRoom),
+		chatRoomList:            make([]string, 0),
+		chatRoomRemark:          make([]string, 0),
+		chatRoomNickName:        make([]string, 0),
 	}
 
 	// 初始化缓存

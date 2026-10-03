@@ -18,12 +18,29 @@ func (r *Repository) initContactCache(ctx context.Context) error {
 	aliasMap := make(map[string][]*model.Contact)
 	remarkMap := make(map[string][]*model.Contact)
 	nickNameMap := make(map[string][]*model.Contact)
+	descriptionMap := make(map[string][]*model.Contact)
+	signatureMap := make(map[string][]*model.Contact)
+	addSceneEnumMap := make(map[string][]*model.Contact)
+	addSceneStringMap := make(map[string][]*model.Contact)
+	countryMap := make(map[string][]*model.Contact)
+	provinceMap := make(map[string][]*model.Contact)
+	cityMap := make(map[string][]*model.Contact)
+	tagIDMap := make(map[string][]*model.Contact)
+	tagNameMap := make(map[string][]*model.Contact)
 	chatRoomUserMap := make(map[string]*model.Contact)
 	chatRoomInContactMap := make(map[string]*model.Contact)
 	contactList := make([]string, 0)
 	aliasList := make([]string, 0)
 	remarkList := make([]string, 0)
 	nickNameList := make([]string, 0)
+	descriptionList := make([]string, 0)
+	signatureList := make([]string, 0)
+	addSceneEnumList := make([]string, 0)
+	addSceneStringList := make([]string, 0)
+	countryList := make([]string, 0)
+	provinceList := make([]string, 0)
+	cityList := make([]string, 0)
+	tagNameList := make([]string, 0)
 
 	// 加载所有联系人到缓存
 	// 暂时忽略获取不到联系人的错误
@@ -64,6 +81,52 @@ func (r *Repository) initContactCache(ctx context.Context) error {
 			nickNameMap[contact.NickName] = nickName
 			nickNameList = append(nickNameList, contact.NickName)
 		}
+		if contact.Description != "" {
+			descriptions, ok := descriptionMap[contact.Description]
+			if !ok {
+				descriptions = make([]*model.Contact, 0)
+			}
+			descriptions = append(descriptions, contact)
+			descriptionMap[contact.Description] = descriptions
+			descriptionList = append(descriptionList, contact.Description)
+		}
+		if contact.Signature != "" {
+			signatureMap[contact.Signature] = append(signatureMap[contact.Signature], contact)
+			signatureList = append(signatureList, contact.Signature)
+		}
+		if contact.AddSceneEnum != "" {
+			if _, exists := addSceneEnumMap[contact.AddSceneEnum]; !exists {
+				addSceneEnumList = append(addSceneEnumList, contact.AddSceneEnum)
+			}
+			addSceneEnumMap[contact.AddSceneEnum] = append(addSceneEnumMap[contact.AddSceneEnum], contact)
+		}
+		if contact.AddSceneString != "" {
+			if _, exists := addSceneStringMap[contact.AddSceneString]; !exists {
+				addSceneStringList = append(addSceneStringList, contact.AddSceneString)
+			}
+			addSceneStringMap[contact.AddSceneString] = append(addSceneStringMap[contact.AddSceneString], contact)
+		}
+		if contact.Country != "" {
+			countryMap[contact.Country] = append(countryMap[contact.Country], contact)
+			countryList = append(countryList, contact.Country)
+		}
+		if contact.Province != "" {
+			provinceMap[contact.Province] = append(provinceMap[contact.Province], contact)
+			provinceList = append(provinceList, contact.Province)
+		}
+		if contact.City != "" {
+			cityMap[contact.City] = append(cityMap[contact.City], contact)
+			cityList = append(cityList, contact.City)
+		}
+		for _, tag := range contact.Tags {
+			if tag.ID != "" {
+				tagIDMap[tag.ID] = append(tagIDMap[tag.ID], contact)
+			}
+			if tag.Name != "" {
+				tagNameMap[tag.Name] = append(tagNameMap[tag.Name], contact)
+				tagNameList = append(tagNameList, tag.Name)
+			}
+		}
 
 		// 如果是群聊成员（非好友），添加到群聊成员索引
 		if !contact.IsFriend {
@@ -79,17 +142,42 @@ func (r *Repository) initContactCache(ctx context.Context) error {
 	sort.Strings(aliasList)
 	sort.Strings(remarkList)
 	sort.Strings(nickNameList)
+	sort.Strings(descriptionList)
+	sort.Strings(signatureList)
+	sort.Strings(addSceneEnumList)
+	sort.Strings(addSceneStringList)
+	sort.Strings(countryList)
+	sort.Strings(provinceList)
+	sort.Strings(cityList)
+	sort.Strings(tagNameList)
 
 	r.contactCache = contactMap
 	r.aliasToContact = aliasMap
 	r.remarkToContact = remarkMap
 	r.nickNameToContact = nickNameMap
+	r.descriptionToContact = descriptionMap
+	r.signatureToContact = signatureMap
+	r.addSceneEnumToContact = addSceneEnumMap
+	r.addSceneStringToContact = addSceneStringMap
+	r.countryToContact = countryMap
+	r.provinceToContact = provinceMap
+	r.cityToContact = cityMap
+	r.tagIDToContact = tagIDMap
+	r.tagNameToContact = tagNameMap
 	r.chatRoomUserToInfo = chatRoomUserMap
 	r.chatRoomInContact = chatRoomInContactMap
 	r.contactList = contactList
 	r.aliasList = aliasList
 	r.remarkList = remarkList
 	r.nickNameList = nickNameList
+	r.descriptionList = descriptionList
+	r.signatureList = signatureList
+	r.addSceneEnumList = addSceneEnumList
+	r.addSceneStringList = addSceneStringList
+	r.countryList = countryList
+	r.provinceList = provinceList
+	r.cityList = cityList
+	r.tagNameList = tagNameList
 	return nil
 }
 
@@ -151,6 +239,33 @@ func (r *Repository) findContact(key string) *model.Contact {
 	if contact, ok := r.nickNameToContact[key]; ok {
 		return contact[0]
 	}
+	if contact, ok := r.descriptionToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.signatureToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.addSceneEnumToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.addSceneStringToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.countryToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.provinceToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.cityToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.tagIDToContact[key]; ok {
+		return contact[0]
+	}
+	if contact, ok := r.tagNameToContact[key]; ok {
+		return contact[0]
+	}
 
 	// Contain
 	for _, alias := range r.aliasList {
@@ -166,6 +281,46 @@ func (r *Repository) findContact(key string) *model.Contact {
 	for _, nickName := range r.nickNameList {
 		if strings.Contains(nickName, key) {
 			return r.nickNameToContact[nickName][0]
+		}
+	}
+	for _, description := range r.descriptionList {
+		if strings.Contains(description, key) {
+			return r.descriptionToContact[description][0]
+		}
+	}
+	for _, signature := range r.signatureList {
+		if strings.Contains(signature, key) {
+			return r.signatureToContact[signature][0]
+		}
+	}
+	for _, addSceneEnum := range r.addSceneEnumList {
+		if strings.Contains(addSceneEnum, key) {
+			return r.addSceneEnumToContact[addSceneEnum][0]
+		}
+	}
+	for _, addSceneString := range r.addSceneStringList {
+		if strings.Contains(addSceneString, key) {
+			return r.addSceneStringToContact[addSceneString][0]
+		}
+	}
+	for _, country := range r.countryList {
+		if strings.Contains(country, key) {
+			return r.countryToContact[country][0]
+		}
+	}
+	for _, province := range r.provinceList {
+		if strings.Contains(province, key) {
+			return r.provinceToContact[province][0]
+		}
+	}
+	for _, city := range r.cityList {
+		if strings.Contains(city, key) {
+			return r.cityToContact[city][0]
+		}
+	}
+	for _, tagName := range r.tagNameList {
+		if strings.Contains(tagName, key) {
+			return r.tagNameToContact[tagName][0]
 		}
 	}
 	return nil
@@ -202,6 +357,78 @@ func (r *Repository) findContacts(key string) []*model.Contact {
 			}
 		}
 	}
+	if contacts, ok := r.descriptionToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.signatureToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.addSceneEnumToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.addSceneStringToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.countryToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.provinceToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.cityToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.tagIDToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
+	if contacts, ok := r.tagNameToContact[key]; ok {
+		for _, contact := range contacts {
+			if !distinct[contact.UserName] {
+				ret = append(ret, contact)
+				distinct[contact.UserName] = true
+			}
+		}
+	}
 	// Contain
 	for _, alias := range r.aliasList {
 		if strings.Contains(alias, key) {
@@ -226,6 +453,86 @@ func (r *Repository) findContacts(key string) []*model.Contact {
 	for _, nickName := range r.nickNameList {
 		if strings.Contains(nickName, key) {
 			for _, contact := range r.nickNameToContact[nickName] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, description := range r.descriptionList {
+		if strings.Contains(description, key) {
+			for _, contact := range r.descriptionToContact[description] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, signature := range r.signatureList {
+		if strings.Contains(signature, key) {
+			for _, contact := range r.signatureToContact[signature] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, addSceneEnum := range r.addSceneEnumList {
+		if strings.Contains(addSceneEnum, key) {
+			for _, contact := range r.addSceneEnumToContact[addSceneEnum] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, addSceneString := range r.addSceneStringList {
+		if strings.Contains(addSceneString, key) {
+			for _, contact := range r.addSceneStringToContact[addSceneString] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, country := range r.countryList {
+		if strings.Contains(country, key) {
+			for _, contact := range r.countryToContact[country] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, province := range r.provinceList {
+		if strings.Contains(province, key) {
+			for _, contact := range r.provinceToContact[province] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, city := range r.cityList {
+		if strings.Contains(city, key) {
+			for _, contact := range r.cityToContact[city] {
+				if !distinct[contact.UserName] {
+					ret = append(ret, contact)
+					distinct[contact.UserName] = true
+				}
+			}
+		}
+	}
+	for _, tagName := range r.tagNameList {
+		if strings.Contains(tagName, key) {
+			for _, contact := range r.tagNameToContact[tagName] {
 				if !distinct[contact.UserName] {
 					ret = append(ret, contact)
 					distinct[contact.UserName] = true

@@ -30,8 +30,8 @@ func (s *Service) initMCPServer() {
 
 var ContactTool = mcp.NewTool(
 	"query_contact",
-	mcp.WithDescription(`查询用户的联系人信息。可以通过姓名、备注名或ID进行查询，返回匹配的联系人列表。当用户询问某人的联系方式、想了解联系人信息或需要查找特定联系人时使用此工具。参数为空时，将返回联系人列表`),
-	mcp.WithString("keyword", mcp.Description("联系人的搜索关键词，可以是姓名、备注名或ID。")),
+	mcp.WithDescription(`查询用户的联系人信息。可以通过姓名、备注名、备注描述、个性签名、添加来源枚举或说明、国家、省份、城市、联系人ID或标签进行查询，返回匹配的联系人列表，包括标签、添加来源代码/枚举/英文说明及地区资料。当用户询问某人的联系方式、想了解联系人信息或需要查找特定联系人时使用此工具。参数为空时，将返回联系人列表`),
+	mcp.WithString("keyword", mcp.Description("联系人的搜索关键词，可以是姓名、备注名、备注描述、个性签名、添加来源枚举或说明、国家、省份、城市、联系人ID、标签名称或标签ID。")),
 )
 
 var ChatRoomTool = mcp.NewTool(
@@ -174,9 +174,9 @@ func (s *Service) handleMCPContact(ctx context.Context, request mcp.CallToolRequ
 		return errors.ErrMCPTool(err), nil
 	}
 	buf := &bytes.Buffer{}
-	buf.WriteString("UserName,Alias,Remark,NickName\n")
-	for _, contact := range list.Items {
-		buf.WriteString(fmt.Sprintf("%s,%s,%s,%s\n", contact.UserName, contact.Alias, contact.Remark, contact.NickName))
+	if err := writeContactsCSV(buf, list.Items); err != nil {
+		log.Error().Err(err).Msg("Failed to encode contacts")
+		return errors.ErrMCPTool(err), nil
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{

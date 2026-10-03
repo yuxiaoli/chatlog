@@ -190,11 +190,9 @@ func (s *Service) handleContacts(c *gin.Context) {
 		}
 		c.Writer.Header().Set("Cache-Control", "no-cache")
 		c.Writer.Header().Set("Connection", "keep-alive")
-		c.Writer.Flush()
-
-		c.Writer.WriteString("UserName,Alias,Remark,NickName\n")
-		for _, contact := range list.Items {
-			c.Writer.WriteString(fmt.Sprintf("%s,%s,%s,%s\n", contact.UserName, contact.Alias, contact.Remark, contact.NickName))
+		if err := writeContactsCSV(c.Writer, list.Items); err != nil {
+			errors.Err(c, err)
+			return
 		}
 		c.Writer.Flush()
 	}

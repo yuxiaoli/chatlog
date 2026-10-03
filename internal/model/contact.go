@@ -1,11 +1,27 @@
 package model
 
+import "strings"
+
+type ContactTag struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type Contact struct {
-	UserName string `json:"userName"`
-	Alias    string `json:"alias"`
-	Remark   string `json:"remark"`
-	NickName string `json:"nickName"`
-	IsFriend bool   `json:"isFriend"`
+	UserName       string       `json:"userName"`
+	Alias          string       `json:"alias"`
+	Remark         string       `json:"remark"`
+	NickName       string       `json:"nickName"`
+	IsFriend       bool         `json:"isFriend"`
+	Description    string       `json:"description"`
+	Tags           []ContactTag `json:"tags"`
+	Signature      string       `json:"signature"`
+	AddScene       *int32       `json:"addScene"`
+	AddSceneEnum   string       `json:"addSceneEnum"`
+	AddSceneString string       `json:"addSceneString"`
+	Country        string       `json:"country"`
+	Province       string       `json:"province"`
+	City           string       `json:"city"`
 }
 
 // CREATE TABLE Contact(
@@ -42,21 +58,59 @@ type Contact struct {
 // Reserved11 TEXT
 // )
 type ContactV3 struct {
-	UserName  string `json:"UserName"`
-	Alias     string `json:"Alias"`
-	Remark    string `json:"Remark"`
-	NickName  string `json:"NickName"`
-	Reserved1 int    `json:"Reserved1"` // 1 自己好友或自己加入的群聊; 0 群聊成员(非好友)
+	UserName    string `json:"UserName"`
+	Alias       string `json:"Alias"`
+	Remark      string `json:"Remark"`
+	NickName    string `json:"NickName"`
+	Reserved1   int    `json:"Reserved1"` // 1 自己好友或自己加入的群聊; 0 群聊成员(非好友)
+	Reserved6   string `json:"Reserved6"`
+	LabelIDList string `json:"LabelIDList"`
+	ExtraBuf    []byte `json:"-"`
 }
 
 func (c *ContactV3) Wrap() *Contact {
-	return &Contact{
-		UserName: c.UserName,
-		Alias:    c.Alias,
-		Remark:   c.Remark,
-		NickName: c.NickName,
-		IsFriend: c.Reserved1 == 1,
+	return c.WrapWithLabelNames(nil)
+}
+
+// WrapWithLabelNames maps the comma-separated LabelIDList to resolved tags.
+// IDs without a ContactLabel definition are retained with an empty name.
+func (c *ContactV3) WrapWithLabelNames(labelNames map[string]string) *Contact {
+	profile, ok := parseContactExtraBuf(c.ExtraBuf)
+	if !ok {
+		profile = contactExtraProfile{}
 	}
+	addSceneEnum, addSceneString := contactAddSceneDetails(profile.AddScene)
+	return &Contact{
+		UserName:       c.UserName,
+		Alias:          c.Alias,
+		Remark:         c.Remark,
+		NickName:       c.NickName,
+		IsFriend:       c.Reserved1 == 1,
+		Description:    c.Reserved6,
+		Tags:           contactTags(c.LabelIDList, labelNames),
+		Signature:      profile.Signature,
+		AddScene:       profile.AddScene,
+		AddSceneEnum:   addSceneEnum,
+		AddSceneString: addSceneString,
+		Country:        profile.Country,
+		Province:       profile.Province,
+		City:           profile.City,
+	}
+}
+
+func contactTags(labelIDList string, labelNames map[string]string) []ContactTag {
+	tags := make([]ContactTag, 0)
+	for _, value := range strings.Split(labelIDList, ",") {
+		id := strings.TrimSpace(value)
+		if id == "" {
+			continue
+		}
+		tags = append(tags, ContactTag{
+			ID:   id,
+			Name: labelNames[id],
+		})
+	}
+	return tags
 }
 
 func (c *Contact) DisplayName() string {
