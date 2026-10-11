@@ -49,11 +49,12 @@ from wechat_backup_archive import BackupArchiveError, iter_backup_segments
 CATALOG_SCHEMA = "export_catalog"
 CHATLOG_SCHEMA = "chatlog"
 STAGING_MANIFEST_FORMAT_VERSION = 2
-EXPORT_SCHEMA_VERSION = 6
+EXPORT_SCHEMA_VERSION = 7
 BATCH_SIZE = 65_536
 BACKUP_MESSAGE_BATCH_SIZE = 65_536
 V4_MESSAGE_TABLE = re.compile(r"^Msg_[0-9a-fA-F]{32}$")
 V4_MESSAGE_DB = re.compile(r"^message_[0-9]{1,2}\.db$", re.IGNORECASE)
+V4_SENDER_ROWID_COLUMN = "__chatlog_sqlite_rowid"
 SQLITE_DYNAMIC_TYPE = "UNION(i BIGINT, d DOUBLE, s VARCHAR, b BLOB)"
 V3_MESSAGE_DB = re.compile(r"^MSG[0-9]{0,2}\.db$", re.IGNORECASE)
 _ACTIVE_RUN_ID: str | None = None
@@ -308,7 +309,8 @@ def parse_specs(manifest: dict[str, Any], manifest_path: Path) -> tuple[list[Acc
             raw_errors = [raw_errors]
         account = AccountSpec(
             account_id=account_id,
-            account_name=as_string(raw_account.get("account") or raw_account.get("id")),
+            # Staging IDs include a path hash and are not source usernames.
+            account_name=as_string(raw_account.get("account")),
             platform=as_string(raw_account.get("platform")),
             version=as_optional_int(raw_account.get("version")),
             full_version=as_string(raw_account.get("full_version")),
@@ -974,18 +976,32 @@ def import_with_python(
 ) -> tuple[int, int, list[tuple[str, str]]]:
     source_name = quote_ident(source.name)
     source_rows = int(sqlite_connection.execute(f"SELECT count(*) FROM {source_name}").fetchone()[0])
-    cursor = sqlite_connection.execute(f"SELECT * FROM {source_name}")
+    preserve_sender_rowid = (
+        database.account.version == 4 and source.name.casefold() == "name2id"
+        and "user_name" in {column.name.casefold() for column in source.columns}
+    )
+    if preserve_sender_rowid and V4_SENDER_ROWID_COLUMN in {column.name.casefold() for column in source.columns}:
+        raise ExportError("Name2Id collides with reserved SQLite row-id provenance column")
+    projection = f"rowid AS {quote_ident(V4_SENDER_ROWID_COLUMN)}, *" if preserve_sender_rowid else "*"
+    cursor = sqlite_connection.execute(f"SELECT {projection} FROM {source_name}")
     first_batch = cursor.fetchmany(BATCH_SIZE)
     source_names = [item[0] for item in (cursor.description or [])]
     destination_names = deduplicate_names(source_names)
     declared_by_name = {column.name.casefold(): column for column in source.columns}
+    if preserve_sender_rowid:
+        declared_by_name[V4_SENDER_ROWID_COLUMN] = SourceColumn(
+            -1, V4_SENDER_ROWID_COLUMN, "INTEGER", True, None, 0
+        )
     source_columns = [
         declared_by_name.get(name.casefold(), SourceColumn(i, name, "", False, None, 0))
         for i, name in enumerate(source_names)
     ]
     storage_by_column: list[set[str]] = [set() for _ in source_names]
     if source_names:
-        storage_query = ", ".join(f"typeof({quote_ident(name)})" for name in source_names)
+        storage_query = ", ".join(
+            "typeof(rowid)" if preserve_sender_rowid and name == V4_SENDER_ROWID_COLUMN
+            else f"typeof({quote_ident(name)})" for name in source_names
+        )
         for storage_row in sqlite_connection.execute(
             f"SELECT DISTINCT {storage_query} FROM {source_name}"
         ):
@@ -1178,7 +1194,13 @@ def import_one_object(
     object_id = short_hash(database.database_id + "\0" + source.object_type + "\0" + source.name, 28)
     extension_error = ""
 
-    if attached_alias is not None:
+    # The generic SQLite scanner SELECT * omits implicit rowid. Sender IDs
+    # require original sparse SQLite rowids, never DuckDB's physical rowid.
+    preserve_sender_rowid = (
+        database.account.version == 4 and source.name.casefold() == "name2id"
+        and "user_name" in {column.name.casefold() for column in source.columns}
+    )
+    if attached_alias is not None and not preserve_sender_rowid:
         duck.execute("BEGIN TRANSACTION")
         try:
             attached_source = (
@@ -1649,6 +1671,15 @@ def contact_value_expr(
     return f"CAST({identifier} AS {cast})"
 
 
+def contact_flag_expr(columns: dict[str, str], name: str, qualifier: str) -> str:
+    """Only canonical integral source values qualify; malformed flags stay unknown."""
+    value = contact_value_expr(columns, name, "VARCHAR", qualifier)
+    return (
+        f"CASE WHEN regexp_full_match({value}, '-?(0|[1-9][0-9]*)') "
+        f"THEN TRY_CAST({value} AS BIGINT) ELSE NULL END"
+    )
+
+
 def stage_contact_extra_buf_profiles(
     duck: duckdb.DuckDBPyConnection,
     raw: str,
@@ -1762,8 +1793,10 @@ def insert_contacts(
         nickname = contact_value_expr(columns, "nickname", "VARCHAR", source_alias)
         # The long profile note is Reserved6. Remark is only the short display name.
         description = contact_value_expr(columns, "reserved6", "VARCHAR", source_alias)
-        reserved1 = contact_value_expr(columns, "reserved1", "BIGINT", source_alias)
-        is_friend = f"CASE WHEN {reserved1} IS NULL THEN NULL ELSE {reserved1} = 1 END"
+        # ContactV3 documents Reserved1: 1 is an address-book contact, 0 is
+        # a nonfriend room member. Other values have no verified meaning.
+        reserved1 = contact_flag_expr(columns, "reserved1", source_alias)
+        is_friend = f"CASE WHEN {reserved1} IN (0, 1) THEN {reserved1} = 1 ELSE NULL END"
         extra_buf_column = columns.get("extrabuf")
         if extra_buf_column is None:
             signature = "CAST(NULL AS VARCHAR)"
@@ -1800,8 +1833,22 @@ def insert_contacts(
         remark = contact_value_expr(columns, "remark", "VARCHAR", source_alias)
         nickname = contact_value_expr(columns, "nick_name", "VARCHAR", source_alias)
         description = contact_value_expr(columns, "description", "VARCHAR", source_alias)
-        local_type = contact_value_expr(columns, "local_type", "BIGINT", source_alias)
-        is_friend = f"CASE WHEN {local_type} IS NULL THEN NULL ELSE {local_type} <> 3 END"
+        local_type = contact_flag_expr(columns, "local_type", source_alias)
+        flag = contact_flag_expr(columns, "flag", source_alias)
+        verify_flag = contact_flag_expr(columns, "verify_flag", source_alias)
+        delete_flag = contact_flag_expr(columns, "delete_flag", source_alias)
+        # Primary implementation documentation describes (flag & 3) != 0:
+        # https://welink.click/database . Never treat local_type <> 3 or a
+        # nonempty remark as positive friendship evidence. This is a local
+        # address-book predicate, not proof of reciprocal server friendship.
+        is_friend = (
+            f"CASE WHEN {local_type} IN (2, 3) OR {delete_flag} = 1 "
+            f"OR {verify_flag} > 0 THEN FALSE "
+            f"WHEN {flag} IS NULL OR {flag} < 0 OR {verify_flag} IS NULL "
+            f"OR {verify_flag} < 0 OR {delete_flag} IS NULL "
+            f"OR {delete_flag} <> 0 THEN NULL "
+            f"ELSE ({flag} & 3) <> 0 END"
+        )
         signature = "CAST(NULL AS VARCHAR)"
         add_scene = "CAST(NULL AS INTEGER)"
         add_scene_enum = "CAST(NULL AS VARCHAR)"
@@ -1818,7 +1865,8 @@ def insert_contacts(
         nickname = contact_value_expr(columns, "nickname", "VARCHAR", source_alias)
         # No Darwin v3 equivalent of Windows Reserved6 has been verified.
         description = "CAST(NULL AS VARCHAR)"
-        is_friend = "TRUE"
+        # Table membership alone has not been verified as friendship evidence.
+        is_friend = "CAST(NULL AS BOOLEAN)"
         signature = "CAST(NULL AS VARCHAR)"
         add_scene = "CAST(NULL AS INTEGER)"
         add_scene_enum = "CAST(NULL AS VARCHAR)"
@@ -1830,6 +1878,16 @@ def insert_contacts(
         parse_warning = "CAST(NULL AS VARCHAR)"
     else:  # pragma: no cover - callers classify the kind before dispatching
         raise ExportError(f"unsupported canonical contact kind: {kind}")
+
+    # These source identities are not eligible person-to-person friends. Keep
+    # their rows/raw evidence while avoiding the old broad contact predicate.
+    is_friend = (
+        f"CASE WHEN {user_name} IS NULL OR trim({user_name}) = '' THEN NULL "
+        f"WHEN ends_with({user_name}, '@chatroom') OR starts_with({user_name}, 'gh_') "
+        f"OR {user_name} = 'filehelper' OR {user_name} = "
+        f"{sql_string(imported.database.account.account_name)} THEN FALSE "
+        f"ELSE {is_friend} END"
+    )
 
     try:
         source = quote_ident(source_alias)
@@ -2246,18 +2304,11 @@ def create_v4_maps(
         )
         """
     )
-    if replace_account_ids:
-        placeholders = ", ".join("?" for _ in replace_account_ids)
-        duck.execute(
-            f"DELETE FROM {quote_ident(CHATLOG_SCHEMA)}.v4_sender_map "
-            f"WHERE account_id IN ({placeholders})",
-            sorted(replace_account_ids),
-        )
     seen_databases: set[str] = set()
     sender_rows: list[tuple[str, str, int, str | None]] = []
     for imported in imported_objects:
         database = imported.database
-        if database.account.version != 4 or database.database_id in seen_databases:
+        if database.account.version != 4 or imported.source.name.casefold() != "name2id" or database.database_id in seen_databases:
             continue
         if (
             replace_account_ids is not None
@@ -2265,29 +2316,59 @@ def create_v4_maps(
         ):
             continue
         seen_databases.add(database.database_id)
-        if database.staged_path is None:
+        user_column = column_lookup(imported.source).get("user_name")
+        if user_column is None:
+            raise ExportError("v4 Name2Id lacks its verified user_name source column")
+        ownership = duck.execute(
+            f"SELECT o.account_id,o.database_id,o.raw_schema,o.raw_table,d.account_id,d.present "
+            f"FROM {quote_ident(CATALOG_SCHEMA)}.objects o JOIN "
+            f"{quote_ident(CATALOG_SCHEMA)}.database_files d ON d.database_id=o.database_id "
+            "WHERE o.object_id=? AND o.import_status='ok'",
+            [imported.object_id],
+        ).fetchone()
+        if ownership != (database.account.account_id, database.database_id, database.account.raw_schema, imported.raw_table, database.account.account_id, True):
+            raise ExportError("v4 sender source does not match its current account/database partition")
+        raw = f"{quote_ident(database.account.raw_schema)}.{quote_ident(imported.raw_table)}"
+        raw_columns = dict(destination_columns(duck, raw))
+        if raw_columns.get(user_column) != "VARCHAR":
+            raise ExportError("v4 Name2Id user_name must be retained as text")
+        names = quote_ident(user_column)
+        source_rows = int(duck.execute(f"SELECT count(*) FROM {raw}").fetchone()[0])
+        if source_rows != imported.imported_rows:
+            raise ExportError("v4 Name2Id retained row count changed")
+        if V4_SENDER_ROWID_COLUMN not in raw_columns:
+            # Legacy raw exports omitted implicit SQLite rowid. Their existing
+            # source-rowid map is the only verified identity evidence. Validate
+            # and retain it; never infer rowid from DuckDB order or stale paths.
+            count, unique = duck.execute(
+                f"SELECT count(*),count(DISTINCT source_rowid) FROM {quote_ident(CHATLOG_SCHEMA)}.v4_sender_map "
+                "WHERE account_id=? AND database_id=?",
+                [database.account.account_id, database.database_id],
+            ).fetchone()
+            invalid = duck.execute(
+                f"SELECT count(*) FROM (SELECT sm.user_name FROM "
+                f"{quote_ident(CHATLOG_SCHEMA)}.v4_sender_map sm "
+                "WHERE sm.account_id=? AND sm.database_id=? EXCEPT ALL "
+                f"SELECT r.{names} FROM {raw} r) AS unmatched_names",
+                [database.account.account_id, database.database_id],
+            ).fetchone()[0]
+            if count != source_rows or unique != count or invalid:
+                raise ExportError("Legacy v4 Name2Id has no verified complete retained sender map; create a full export")
             continue
-        sqlite_connection = open_sqlite(database.staged_path)
-        try:
-            names = sqlite_connection.execute(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND lower(name)='name2id'"
-            ).fetchall()
-            if not names:
-                continue
-            table = quote_ident(str(names[0][0]))
-            info = sqlite_connection.execute(f"PRAGMA table_info({table})").fetchall()
-            source_columns = {str(row[1]).casefold(): str(row[1]) for row in info}
-            user_column = source_columns.get("user_name")
-            if user_column is None:
-                continue
-            for rowid, user_name in sqlite_connection.execute(
-                f"SELECT rowid, {quote_ident(user_column)} FROM {table}"
-            ):
-                sender_rows.append(
-                    (database.account.account_id, database.database_id, int(rowid), user_name)
-                )
-        finally:
-            sqlite_connection.close()
+        if raw_columns[V4_SENDER_ROWID_COLUMN] != "BIGINT":
+            raise ExportError("v4 Name2Id SQLite row-id provenance must be integral")
+        rowid_column = quote_ident(V4_SENDER_ROWID_COLUMN)
+        count, unique = duck.execute(f"SELECT count(*),count(DISTINCT {rowid_column}) FROM {raw}").fetchone()
+        if count != unique:
+            raise ExportError("v4 Name2Id SQLite row-id provenance is missing or duplicated")
+        duck.execute(
+            f"DELETE FROM {quote_ident(CHATLOG_SCHEMA)}.v4_sender_map WHERE account_id=? AND database_id=?",
+            [database.account.account_id, database.database_id],
+        )
+        sender_rows.extend(
+            (database.account.account_id, database.database_id, int(rowid), user_name)
+            for rowid, user_name in duck.execute(f"SELECT {rowid_column},{names} FROM {raw}").fetchall()
+        )
     if sender_rows:
         duck.executemany(
             f"INSERT INTO {quote_ident(CHATLOG_SCHEMA)}.v4_sender_map VALUES (?, ?, ?, ?)",
@@ -2307,7 +2388,7 @@ def insert_v3_messages(duck: duckdb.DuckDBPyConnection, imported: ImportedObject
     source_object = sql_string(imported.source.name)
     local_id = columns["localid"]
     talker = columns["strtalker"]
-    is_sender = columns["issender"]
+    sender_flag = contact_flag_expr(columns, "issender", "raw_message")
     create_time = columns["createtime"]
     raw_type = columns["type"]
     raw_subtype_expr = (
@@ -2334,11 +2415,11 @@ def insert_v3_messages(duck: duckdb.DuckDBPyConnection, imported: ImportedObject
             CASE WHEN CAST({quote_ident(create_time)} AS BIGINT) BETWEEN 0 AND 253402300799
                  THEN to_timestamp(CAST({quote_ident(create_time)} AS BIGINT)) ELSE NULL END,
             CAST({quote_ident(talker)} AS VARCHAR), NULL,
-            CASE WHEN CAST({quote_ident(is_sender)} AS BIGINT) = 0
+            CASE WHEN {sender_flag} = 0
                       AND NOT ends_with(CAST({quote_ident(talker)} AS VARCHAR), '@chatroom')
                  THEN CAST({quote_ident(talker)} AS VARCHAR) ELSE NULL END,
             ends_with(CAST({quote_ident(talker)} AS VARCHAR), '@chatroom'),
-            CAST({quote_ident(is_sender)} AS BIGINT) <> 0,
+            CASE WHEN {sender_flag} IN (0, 1) THEN {sender_flag} = 1 ELSE NULL END,
             CAST({quote_ident(raw_type)} AS BIGINT) & 4294967295,
             {semantic_subtype_expr},
             CAST({quote_ident(raw_type)} AS BIGINT), {raw_subtype_expr},
@@ -2356,10 +2437,34 @@ def insert_v3_messages(duck: duckdb.DuckDBPyConnection, imported: ImportedObject
             {expr(columns, 'bytestrans', 'BLOB')},
             {expr(columns, 'translatedcontent', 'VARCHAR')},
             {expr(columns, 'translatedbrand', 'VARCHAR')}
-        FROM {raw}
+        FROM {raw} AS raw_message
         """
     )
     return int(result.fetchone()[0])
+
+
+def sender_direction_expr(sender: str, talker: str, owner: str) -> str:
+    """Use resolved identities; unrelated private senders do not prove outgoing."""
+    known_owner = f"({owner} IS NOT NULL AND trim({owner}) <> '')"
+    return (
+        f"CASE WHEN {sender} IS NULL OR trim({sender}) = '' THEN NULL "
+        f"WHEN {known_owner} AND {sender} = {owner} THEN TRUE "
+        f"WHEN {talker} IS NOT NULL AND trim({talker}) <> '' "
+        f"AND NOT ends_with({talker}, '@chatroom') AND {sender} = {talker} THEN FALSE "
+        f"WHEN {known_owner} AND ends_with({talker}, '@chatroom') THEN FALSE "
+        f"ELSE NULL END"
+    )
+
+
+def refresh_identity_directions(duck: duckdb.DuckDBPyConnection) -> None:
+    """Correct reused v4/phone rows without opening live sources or changing keys."""
+    owner = "NULLIF(a.account_name, a.account_id)"
+    direction = sender_direction_expr("m.sender_id", "m.talker_id", owner)
+    duck.execute(
+        f"UPDATE {quote_ident(CHATLOG_SCHEMA)}.messages AS m SET is_self={direction} "
+        f"FROM {quote_ident(CATALOG_SCHEMA)}.accounts AS a "
+        "WHERE a.account_id=m.account_id AND m.source_kind IN ('v4_msg', 'phone_backup')"
+    )
 
 
 def insert_v4_messages(duck: duckdb.DuckDBPyConnection, imported: ImportedObject) -> int:
@@ -2395,6 +2500,11 @@ def insert_v4_messages(duck: duckdb.DuckDBPyConnection, imported: ImportedObject
 
     message_content = payload_as_blob("message_content")
     packed_info_data = payload_as_blob("packed_info_data")
+    # status=2 is a transport heuristic marked inaccurate in MessageV4.Wrap.
+    # account_id contains a path hash; only account_name is a sender username.
+    direction = sender_direction_expr(
+        "sm.user_name", "tm.user_name", sql_string(imported.database.account.account_name)
+    )
     result = duck.execute(
         f"""
         INSERT INTO {quote_ident(CHATLOG_SCHEMA)}.messages
@@ -2410,10 +2520,7 @@ def insert_v4_messages(duck: duckdb.DuckDBPyConnection, imported: ImportedObject
                  THEN to_timestamp(CAST(m.{create_time} AS BIGINT)) ELSE NULL END,
             tm.user_name, {sql_string(talker_hash)}, sm.user_name,
             CASE WHEN tm.user_name IS NULL THEN NULL ELSE ends_with(tm.user_name, '@chatroom') END,
-            CASE WHEN CAST(m.{status} AS BIGINT) = 2 THEN TRUE
-                 WHEN tm.user_name IS NULL OR sm.user_name IS NULL THEN NULL
-                 WHEN NOT ends_with(tm.user_name, '@chatroom') AND tm.user_name <> sm.user_name THEN TRUE
-                 ELSE FALSE END,
+            {direction},
             CAST(m.{raw_type} AS BIGINT) & 4294967295,
             CAST(m.{raw_type} AS BIGINT) >> 32,
             CAST(m.{raw_type} AS BIGINT), NULL,
@@ -3034,6 +3141,7 @@ def project_phone_backup_messages(
             list(database_ids),
         ).fetchone()[0]
     )
+    direction = sender_direction_expr("r.sender_id", "r.talker_id", "a.account_name")
     duck.execute(
         f"""
         INSERT INTO {quote_ident(CHATLOG_SCHEMA)}.messages (
@@ -3062,7 +3170,7 @@ def project_phone_backup_messages(
             r.sender_id,
             CASE WHEN r.talker_id IS NULL THEN NULL
                  ELSE ends_with(r.talker_id, '@chatroom') END,
-            NULL,
+            {direction},
             r.message_type,
             r.message_type,
             r.msg_sequence,
@@ -4188,6 +4296,18 @@ def apply_delta(
 ) -> dict[str, int]:
     create_backup_message_tables(duck)
     rebuild_contacts_from_catalog(duck)
+    if baseline_schema_version < 7:
+        # Reproject only legacy v3 messages from retained raw tables. No live
+        # SQLite is needed, and keys/rows outside these partitions survive.
+        for imported in load_current_imported_objects(duck, {}):
+            kind, _required = canonical_kind(imported)
+            if kind is not None and kind.startswith("v3_"):
+                duck.execute(
+                    f"DELETE FROM {quote_ident(CHATLOG_SCHEMA)}.messages "
+                    "WHERE database_id=? AND source_object=?",
+                    [imported.database.database_id, imported.source.name],
+                )
+                insert_v3_messages(duck, imported, kind)
     validate_delta_account_identity(duck, accounts)
     old_account_versions = {
         str(account_id): as_optional_int(version)
@@ -4484,6 +4604,10 @@ def apply_delta(
     project_phone_backup_messages(
         duck, [database.database_id for database in changed_backup_databases]
     )
+    # Semantic v7 also corrects unchanged canonical rows; old status/peer
+    # heuristics cannot survive a no-op Delta after the adapter is upgraded.
+    if baseline_schema_version < 7:
+        refresh_identity_directions(duck)
 
     duplicate_messages = int(
         duck.execute(

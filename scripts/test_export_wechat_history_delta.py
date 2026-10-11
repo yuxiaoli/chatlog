@@ -13,13 +13,29 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 from Crypto.Cipher import AES
 
 from export_wechat_history import (
     CONTACT_ADD_SCENES,
+    EXPORT_SCHEMA_VERSION,
+    AccountSpec,
+    DatabaseSpec,
+    ImportedObject,
+    SourceColumn,
+    SourceObject,
     ExportError,
+    create_catalog,
+    create_contacts_table,
+    create_messages_table,
+    create_backup_message_tables,
+    insert_contacts,
+    insert_v4_messages,
+    insert_v3_messages,
+    parse_specs,
+    project_phone_backup_messages,
     contact_add_scene_values,
     export,
     parse_contact_extra_buf,
@@ -270,15 +286,18 @@ def create_v4_contact_database(path: Path) -> None:
                 alias TEXT,
                 remark TEXT,
                 nick_name TEXT,
-                description TEXT
+                description TEXT,
+                flag INTEGER,
+                verify_flag INTEGER,
+                delete_flag INTEGER
             )
             """
         )
         connection.executemany(
-            "INSERT INTO contact VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO contact VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                ("v4-friend", 5, "v4-id", "V4 short", "V4 nick", "V4 long"),
-                ("v4-member", 3, "", "", "Member", "Member note"),
+                ("v4-friend", 1, "v4-id", "V4 short", "V4 nick", "V4 long", 3, 0, 0),
+                ("v4-member", 3, "", "", "Member", "Member note", 0, 0, 0),
             ],
         )
         connection.commit()
@@ -607,6 +626,240 @@ class BackupKeyResolutionTest(unittest.TestCase):
             self.assertNotIn(invalid_secret, str(raised.exception))
 
 
+class RawQualificationTest(unittest.TestCase):
+    """In-memory source evidence only; no live SQLite, key, or network reads."""
+
+    @staticmethod
+    def source(duck, relative, kind, columns, rows, account_name="self-user"):
+        account = AccountSpec(
+            "self-user_pathhash", account_name, "windows", 4, "fixture", "", "",
+            False, "fixture", True, "complete", (), "raw_fixture",
+        )
+        database = DatabaseSpec(
+            "fixture-db", account, "", relative, None, None, "", "", None, "",
+            "", "copied_plaintext", "ok", "",
+        )
+        source = SourceObject("table", kind, None, tuple(
+            SourceColumn(index, name, declaration, False, None, 0)
+            for index, (name, declaration) in enumerate(columns)
+        ))
+        duck.execute("CREATE SCHEMA IF NOT EXISTS raw_fixture")
+        duck.execute("DROP TABLE IF EXISTS raw_fixture.source")
+        duck.execute("CREATE TABLE raw_fixture.source (" + ",".join(
+            '"' + name + '" ' + declaration for name, declaration in columns
+        ) + ")")
+        duck.executemany("INSERT INTO raw_fixture.source VALUES (" + ",".join("?" for _ in columns) + ")", rows)
+        return ImportedObject("fixture-object", database, source, "source", len(rows), len(rows), "fixture")
+
+    def test_friend_eligibility_requires_positive_source_flags(self):
+        with duckdb.connect(":memory:") as duck:
+            create_catalog(duck)
+            create_contacts_table(duck)
+            imported = self.source(duck, "contact/contact.db", "contact", [
+                ("username", "VARCHAR"), ("local_type", "BIGINT"),
+                ("flag", "BIGINT"), ("verify_flag", "BIGINT"), ("delete_flag", "BIGINT"),
+            ], [
+                ("friend-both", 1, 3, 0, 0), ("friend-bit1", 1, 1, 0, 0),
+                ("friend-bit2", 1, 2, 0, 0), ("stranger", 1, 0, 0, 0),
+                ("missing", 1, None, 0, 0), ("invalid", 1, -1, 0, 0),
+                ("group-member", 3, 3, 0, 0), ("room@chatroom", 2, 3, 0, 0),
+                ("gh_official", 1, 3, 0, 0), ("verified-account", 1, 3, 8, 0),
+                ("deleted", 1, 3, 0, 1), ("unknown-verify", 1, 3, None, 0),
+                ("unknown-delete", 1, 3, 0, None),
+            ])
+            insert_contacts(duck, imported, "v4_contact")
+            self.assertEqual(dict(duck.execute("SELECT user_name,is_friend FROM chatlog.contacts").fetchall()), {
+                "friend-both": True, "friend-bit1": True, "friend-bit2": True,
+                "stranger": False, "missing": None, "invalid": None,
+                "group-member": False, "room@chatroom": False, "gh_official": False,
+                "verified-account": False, "deleted": False,
+                "unknown-verify": None, "unknown-delete": None,
+            })
+
+    def test_unverified_flags_and_darwin_contacts_remain_unknown(self):
+        with duckdb.connect(":memory:") as duck:
+            create_catalog(duck)
+            create_contacts_table(duck)
+            imported = self.source(duck, "MicroMsg.db", "Contact", [
+                ("UserName", "VARCHAR"), ("Reserved1", "VARCHAR"),
+            ], [("friend", "1"), ("member", "0"), ("unverified", "9"),
+                ("malformed", "1.0"), ("room@chatroom", "1")])
+            insert_contacts(duck, imported, "windows_v3_contact")
+            self.assertEqual(dict(duck.execute("SELECT user_name,is_friend FROM chatlog.contacts").fetchall()), {
+                "friend": True, "member": False, "unverified": None,
+                "malformed": None, "room@chatroom": False,
+            })
+            duck.execute("DELETE FROM chatlog.contacts")
+            imported = self.source(duck, "contact.db", "contact", [
+                ("username", "VARCHAR"), ("local_type", "BIGINT"), ("remark", "VARCHAR"),
+            ], [("unverified-v4", 1, "existing remark"), ("enterprise", 5, "")])
+            insert_contacts(duck, imported, "v4_contact")
+            self.assertEqual(duck.execute("SELECT is_friend FROM chatlog.contacts").fetchall(), [(None,), (None,)])
+            duck.execute("DELETE FROM chatlog.contacts")
+            imported = self.source(duck, "wccontact_new2.db", "WCContact", [
+                ("m_nsUsrName", "VARCHAR"), ("nickname", "VARCHAR"),
+            ], [("unverified-darwin", "synthetic")])
+            insert_contacts(duck, imported, "darwin_v3_contact")
+            self.assertEqual(duck.execute("SELECT is_friend FROM chatlog.contacts").fetchall(), [(None,)])
+
+    def test_live_and_phone_direction_use_account_name_and_peer_evidence(self):
+        with duckdb.connect(":memory:") as duck:
+            create_catalog(duck)
+            create_messages_table(duck)
+            peer_hash = hashlib.md5(b"peer", usedforsecurity=False).hexdigest()
+            imported = self.source(duck, "message/message_0.db", "Msg_" + peer_hash, [
+                ("local_id", "BIGINT"), ("server_id", "BIGINT"), ("local_type", "BIGINT"),
+                ("sort_seq", "BIGINT"), ("real_sender_id", "BIGINT"), ("create_time", "BIGINT"),
+                ("message_content", "BLOB"), ("packed_info_data", "BLOB"), ("status", "BIGINT"),
+            ], [(index, index, 1, index, index, 1700000000, b"synthetic", b"", status)
+                for index, status in enumerate([4, 2, 2, 2, 2], start=1)])
+            duck.execute("CREATE TABLE chatlog.v4_talker_map(account_id VARCHAR,talker_hash VARCHAR,user_name VARCHAR)")
+            duck.execute("INSERT INTO chatlog.v4_talker_map VALUES (?,?,?)", [imported.database.account.account_id, peer_hash, "peer"])
+            duck.execute("CREATE TABLE chatlog.v4_sender_map(account_id VARCHAR,database_id VARCHAR,source_rowid BIGINT,user_name VARCHAR)")
+            senders = ["self-user", "peer", "unknown-user", None, "self-user_pathhash"]
+            duck.executemany("INSERT INTO chatlog.v4_sender_map VALUES (?,?,?,?)", [
+                (imported.database.account.account_id, imported.database.database_id, index, sender)
+                for index, sender in enumerate(senders, start=1)
+            ])
+            insert_v4_messages(duck, imported)
+            self.assertEqual(duck.execute("SELECT is_self FROM chatlog.messages ORDER BY source_local_id").fetchall(),
+                [(True,), (False,), (None,), (None,), (None,)])
+            duck.execute("DELETE FROM chatlog.messages")
+            create_backup_message_tables(duck)
+            duck.execute("INSERT INTO export_catalog.accounts(account_id,account_name,resolved,raw_schema) VALUES (?,?,true,'raw_fixture')", [imported.database.account.account_id, "self-user"])
+            duck.execute("INSERT INTO export_catalog.database_files(database_id,account_id,import_status,imported_objects,source_rows,imported_rows,present) VALUES (?,?,'ok',0,0,0,true)", [imported.database.database_id, imported.database.account.account_id])
+            duck.executemany("INSERT INTO chatlog.backup_message_records(source_message_key,account_id,database_id,segment_key,message_ordinal,record_offset,record_length,talker_id,sender_id,raw_record) VALUES (?,?,?,'fixture',?,0,0,'peer',?,?)", [
+                (str(index), imported.database.account.account_id, imported.database.database_id, index, sender, b"synthetic")
+                for index, sender in enumerate(senders, start=1)
+            ])
+            project_phone_backup_messages(duck, [imported.database.database_id])
+            self.assertEqual(duck.execute("SELECT is_self FROM chatlog.messages ORDER BY source_message_key").fetchall(),
+                [(True,), (False,), (None,), (None,), (None,)])
+
+    def test_catalog_account_id_is_never_a_fallback_sender_username(self):
+        accounts, _ = parse_specs({"accounts": [{"id": "self-user_pathhash", "files": []}]}, Path("synthetic-manifest.json"))
+        self.assertEqual(accounts[0].account_id, "self-user_pathhash")
+        self.assertEqual(accounts[0].account_name, "")
+
+    def test_v3_direction_only_accepts_documented_binary_sender_flag(self):
+        with duckdb.connect(":memory:") as duck:
+            create_catalog(duck)
+            create_messages_table(duck)
+            imported = self.source(duck, "Msg/MSG0.db", "MSG", [
+                ("localId", "BIGINT"), ("msgSvrId", "BIGINT"), ("Type", "BIGINT"),
+                ("isSender", "VARCHAR"), ("createTime", "BIGINT"),
+                ("strTalker", "VARCHAR"), ("strContent", "VARCHAR"),
+            ], [(index, index, 1, flag, 1700000000, "peer", "synthetic")
+                for index, flag in enumerate(["0", "1", "9", "1.0", None], start=1)])
+            insert_v3_messages(duck, imported, "v3_msg")
+            self.assertEqual(duck.execute("SELECT is_self FROM chatlog.messages ORDER BY source_local_id").fetchall(),
+                [(False,), (True,), (None,), (None,), (None,)])
+
+    def test_delta_corrects_direction_without_reimporting_unchanged_raw_sources(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-direction-upgrade-") as raw_root:
+            root = Path(raw_root)
+            database, baseline, updated = root / "message_0.db", root / "base.duckdb", root / "delta.duckdb"
+            create_v4_message_database(database)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
+                connection.execute("INSERT INTO Name2Id(rowid,user_name) VALUES (0,'fixture')")
+                connection.commit()
+            finally:
+                connection.close()
+            with patch("export_wechat_history.try_load_sqlite_extension", return_value=(False, None)):
+                export(manifest_for(database, root / "full.json", relative_path="message/message_0.db", account_version=4), baseline)
+                with duckdb.connect(str(baseline)) as duck:
+                    duck.execute("UPDATE chatlog.messages SET is_self=false")
+                    duck.execute("UPDATE export_catalog.meta SET schema_version=6")
+                    duck.execute("CHECKPOINT")
+                summary = export(manifest_for(database, root / "delta.json", status="unchanged", relative_path="message/message_0.db", account_version=4), updated, base_path=baseline)
+            self.assertEqual(summary["reused"], 1)
+            self.assertEqual(summary["changed"], 0)
+            with duckdb.connect(str(updated), read_only=True) as duck:
+                self.assertEqual(duck.execute("SELECT is_self FROM chatlog.messages").fetchall(), [(True,)])
+            with duckdb.connect(str(baseline), read_only=True) as duck:
+                self.assertEqual(duck.execute("SELECT is_self FROM chatlog.messages").fetchall(), [(False,)])
+
+    def test_changed_v4_partition_retains_sender_ids_when_unchanged_staging_is_gone(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-retained-sender-") as raw_root:
+            root = Path(raw_root)
+            databases = [root / "message_0.db", root / "message_1.db"]
+            peer_hash = hashlib.md5(b"peer", usedforsecurity=False).hexdigest()
+            table = "Msg_" + peer_hash
+            for index, database in enumerate(databases):
+                create_v4_message_database(database)
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute("ALTER TABLE Msg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RENAME TO " + table)
+                    connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
+                    connection.executemany("INSERT INTO Name2Id(rowid,user_name) VALUES (?,?)", [(17 + index * 24, "fixture"), (18 + index * 24, "peer")])
+                    connection.execute("UPDATE " + table + " SET real_sender_id=?", [17 if index == 0 else 42])
+                    connection.commit()
+                finally:
+                    connection.close()
+
+            def combined_manifest(name, unchanged=False):
+                payloads = [json.loads(manifest_for(database, root / f"{name}-{index}.json", status="unchanged" if unchanged and index == 0 else "ok", relative_path=f"message/message_{index}.db", account_version=4, data_dir=root).read_text()) for index, database in enumerate(databases)]
+                payloads[0]["accounts"][0]["files"].extend(payloads[1]["accounts"][0]["files"])
+                path = root / (name + ".json")
+                path.write_text(json.dumps(payloads[0]), encoding="utf8")
+                return path
+
+            baseline, updated = root / "base.duckdb", root / "delta.duckdb"
+            with patch("export_wechat_history.try_load_sqlite_extension", return_value=(False, None)):
+                export(combined_manifest("full"), baseline)
+                with duckdb.connect(str(baseline)) as duck:
+                    raw_schema, raw_table = duck.execute("SELECT o.raw_schema,o.raw_table FROM export_catalog.objects o JOIN export_catalog.database_files d ON d.database_id=o.database_id WHERE d.relative_path='message/message_0.db' AND lower(o.source_name)='name2id'").fetchone()
+                    qualified = '"' + raw_schema + '"."' + raw_table + '"'
+                    self.assertEqual(duck.execute("SELECT __chatlog_sqlite_rowid,user_name FROM " + qualified + " ORDER BY __chatlog_sqlite_rowid").fetchall(), [(17, "fixture"), (18, "peer")])
+                    duck.execute("ALTER TABLE " + qualified + " DROP COLUMN __chatlog_sqlite_rowid")
+                    duck.execute("UPDATE export_catalog.meta SET schema_version=6")
+                    duck.execute("CHECKPOINT")
+                connection = sqlite3.connect(databases[1])
+                try:
+                    connection.execute("INSERT INTO " + table + " VALUES (2,9002,1,11,41,1700000100,?, ?,4)", [b"same-second late synthetic", b""])
+                    connection.commit()
+                finally:
+                    connection.close()
+                delta_manifest = combined_manifest("delta", unchanged=True)
+                databases[0].unlink()
+                before = file_digest(baseline)
+                summary = export(delta_manifest, updated, base_path=baseline)
+                self.assertEqual(file_digest(baseline), before)
+                bad_baseline = root / "invalid-map.duckdb"
+                shutil.copy2(baseline, bad_baseline)
+                with duckdb.connect(str(bad_baseline)) as duck:
+                    duck.execute("UPDATE chatlog.v4_sender_map SET source_rowid=0 WHERE database_id IN (SELECT database_id FROM export_catalog.database_files WHERE relative_path='message/message_0.db')")
+                    duck.execute("CHECKPOINT")
+                invalid_before, failed_output = file_digest(bad_baseline), root / "rejected.duckdb"
+                with self.assertRaisesRegex(ExportError, "retained sender map"):
+                    export(delta_manifest, failed_output, base_path=bad_baseline)
+                self.assertEqual(file_digest(bad_baseline), invalid_before)
+                self.assertFalse(failed_output.exists())
+            self.assertEqual((summary["reused"], summary["changed"]), (1, 1))
+            with duckdb.connect(str(updated), read_only=True) as duck:
+                rows = duck.execute("SELECT source_relative_path,source_local_id,sender_id,is_self FROM chatlog.messages ORDER BY source_relative_path,source_local_id").fetchall()
+                self.assertEqual(rows, [("message/message_0.db", 1, "fixture", True), ("message/message_1.db", 1, "peer", False), ("message/message_1.db", 2, "fixture", True)])
+                self.assertEqual(duck.execute("SELECT count(DISTINCT source_message_key) FROM chatlog.messages").fetchone()[0], 3)
+
+    def test_empty_v4_name2id_keeps_integral_provenance_without_guessing_sender(self):
+        with tempfile.TemporaryDirectory(prefix="wechat-empty-sender-") as raw_root:
+            root = Path(raw_root)
+            database, output = root / "message_0.db", root / "history.duckdb"
+            create_v4_message_database(database)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
+                connection.commit()
+            finally:
+                connection.close()
+            with patch("export_wechat_history.try_load_sqlite_extension", return_value=(False, None)):
+                export(manifest_for(database, root / "manifest.json", relative_path="message/message_0.db", account_version=4), output)
+            with duckdb.connect(str(output), read_only=True) as duck:
+                self.assertEqual(duck.execute("SELECT is_self FROM chatlog.messages").fetchall(), [(None,)])
+
+
 class DeltaExportIntegrationTest(unittest.TestCase):
     def test_contact_add_scene_enum_and_string_mapping(self) -> None:
         expected = {
@@ -899,7 +1152,7 @@ class DeltaExportIntegrationTest(unittest.TestCase):
                         self.assertEqual(rows[0][0], "darwin_v3_contact")
                         self.assertEqual(rows[0][6], "Darwin short")
                         self.assertIsNone(rows[0][8])
-                        self.assertIs(rows[0][9], True)
+                        self.assertIsNone(rows[0][9])
                         self.assertEqual(
                             rows[0][10:16],
                             (None, None, None, None, None, "not_applicable"),
@@ -1027,7 +1280,7 @@ class DeltaExportIntegrationTest(unittest.TestCase):
                     connection.execute(
                         "SELECT schema_version FROM export_catalog.meta"
                     ).fetchone()[0],
-                    6,
+                    EXPORT_SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     connection.execute(
@@ -1143,7 +1396,7 @@ class DeltaExportIntegrationTest(unittest.TestCase):
                     connection.execute(
                         "SELECT schema_version FROM export_catalog.meta"
                     ).fetchone()[0],
-                    6,
+                    EXPORT_SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     connection.execute(
@@ -1371,7 +1624,7 @@ class DeltaExportIntegrationTest(unittest.TestCase):
                     connection.execute(
                         "SELECT schema_version FROM export_catalog.meta"
                     ).fetchone()[0],
-                    6,
+                    EXPORT_SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     connection.execute(
@@ -2293,7 +2546,7 @@ class DeltaExportIntegrationTest(unittest.TestCase):
                     connection.execute(
                         "SELECT schema_version FROM export_catalog.meta"
                     ).fetchone()[0],
-                    6,
+                    EXPORT_SCHEMA_VERSION,
                 )
             finally:
                 connection.close()
