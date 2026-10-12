@@ -45,13 +45,11 @@ still imported.
 The first run may use the network to provision the Go toolchain, Python, and
 DuckDB components when they are not already available locally.
 
-For accounts whose key has never been cached by chatlog, sign in and leave
-WeChat running when the export starts. The exporter captures every needed live
-key in memory, then checks for WeChat and Weixin processes before creating
-source snapshots. When either is running, it prompts you to exit WeChat
-completely and does not continue until the processes have stopped. If live key
-capture fails, use chatlog's "get key" action and rerun. In a non-interactive
-host the exporter fails with the exit instruction instead of waiting.
+For accounts whose key has never been cached by chatlog, run -SaveKeysOnly
+while signed in first, then exit WeChat completely before exporting. The exporter
+checks WeChat and Weixin processes before creating source snapshots. If either
+is running, it fails with an exit instruction without waiting for confirmation.
+Key validation and source stability checks remain required.
 
 .PARAMETER OutputPath
 Destination directory or a full .duckdb file path. Defaults to G:/wechat/.

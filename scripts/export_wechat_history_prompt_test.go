@@ -9,6 +9,27 @@ import (
 	"testing"
 )
 
+type confirmationInput struct{ reads int }
+
+func (input *confirmationInput) Read([]byte) (int, error) {
+	input.reads++
+	return 0, errors.New("confirmation input must not be read")
+}
+
+func TestWaitForWeChatExitNeverReadsConfirmation(t *testing.T) {
+	checks := 0
+	probe := func() ([]runningWeChatClient, error) {
+		checks++
+		return []runningWeChatClient{{Name: "WeChat", PID: 42}}, nil
+	}
+	input := &confirmationInput{}
+	var output bytes.Buffer
+	err := waitForWeChatExitWith(probe, input, &output, true, map[uint32]bool{42: true})
+	if err == nil || !strings.Contains(err.Error(), "Exit WeChat and rerun") || input.reads != 0 || checks != 1 || output.Len() != 0 {
+		t.Fatalf("expected a noninteractive process failure: err=%v reads=%d checks=%d output=%q", err, input.reads, checks, output.String())
+	}
+}
+
 func TestWaitForWeChatExitNoRunningClient(t *testing.T) {
 	checks := 0
 	probe := func() ([]runningWeChatClient, error) {
@@ -24,7 +45,7 @@ func TestWaitForWeChatExitNoRunningClient(t *testing.T) {
 	}
 }
 
-func TestWaitForWeChatExitPromptsAndRechecks(t *testing.T) {
+func TestWaitForWeChatExitFailsWithoutPromptingWhenClientIsRunning(t *testing.T) {
 	checks := 0
 	probe := func() ([]runningWeChatClient, error) {
 		checks++
@@ -34,15 +55,9 @@ func TestWaitForWeChatExitPromptsAndRechecks(t *testing.T) {
 		return nil, nil
 	}
 	var output bytes.Buffer
-	if err := waitForWeChatExitWith(probe, strings.NewReader("\n"), &output, true, map[uint32]bool{42: true}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if checks != 2 {
-		t.Fatalf("expected two process checks, got %d", checks)
-	}
-	text := output.String()
-	if !strings.Contains(text, "fixture (PID 42)") || !strings.Contains(text, "press Enter") {
-		t.Fatalf("prompt is not actionable: %q", text)
+	err := waitForWeChatExitWith(probe, strings.NewReader("\n"), &output, true, map[uint32]bool{42: true})
+	if err == nil || !strings.Contains(err.Error(), "fixture (PID 42)") || checks != 1 || output.Len() != 0 {
+		t.Fatalf("expected an actionable failure without confirmation: err=%v checks=%d output=%q", err, checks, output.String())
 	}
 }
 
@@ -56,11 +71,9 @@ func TestWaitForWeChatExitConfigOnlyModeDoesNotRequireLiveKeyAssociation(t *test
 		return nil, nil
 	}
 	var output bytes.Buffer
-	if err := waitForWeChatExitWith(probe, strings.NewReader("\n"), &output, true, nil); err != nil {
-		t.Fatalf("config-only shutdown prompt unexpectedly required live-key capture: %v", err)
-	}
-	if checks != 2 || !strings.Contains(output.String(), "WeChat (PID 77)") {
-		t.Fatalf("config-only shutdown prompt did not recheck the client: checks=%d output=%q", checks, output.String())
+	err := waitForWeChatExitWith(probe, strings.NewReader("\n"), &output, true, nil)
+	if err == nil || !strings.Contains(err.Error(), "WeChat (PID 77)") || strings.Contains(err.Error(), "live-key capture") || checks != 1 || output.Len() != 0 {
+		t.Fatalf("config-only check incorrectly depended on live keys or confirmation: err=%v checks=%d output=%q", err, checks, output.String())
 	}
 }
 
@@ -69,8 +82,7 @@ func TestWaitForWeChatExitFailsClearlyWithoutInteractiveInput(t *testing.T) {
 		return []runningWeChatClient{{Name: "fixture", PID: 43}}, nil
 	}
 	err := waitForWeChatExitWith(probe, strings.NewReader(""), &bytes.Buffer{}, false, map[uint32]bool{43: true})
-	if err == nil || !strings.Contains(err.Error(), "interactive prompting is unavailable") ||
-		!strings.Contains(err.Error(), "Exit WeChat and rerun") {
+	if err == nil || !strings.Contains(err.Error(), "Exit WeChat and rerun") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

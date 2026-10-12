@@ -4,12 +4,12 @@ Creates an all-or-nothing backup of every configured WeChat .db file as
 ordinary, decrypted SQLite databases.
 
 .DESCRIPTION
-Reads database keys from the central chatlog.json, validates them before asking
-you to exit WeChat, recursively stages every .db file from every configured
+Reads database keys from the central chatlog.json, validates them and checks
+that WeChat has exited, recursively stages every .db file from every configured
 account, runs PRAGMA integrity_check, and publishes the completed directory only
 after every database succeeds. If an encrypted phone-backup database needs a
 key that has not been cached yet, keep WeChat signed in: the script invokes the
-exporter's protected key-cache mode before asking you to exit WeChat.
+exporter's protected key-cache mode before checking that WeChat has exited.
 
 The destination contains the SQLite files plus a key-free inventory named
 .chatlog-sqlite-backup.json. It never contains chatlog.json, DataKey, ImgKey,
@@ -45,8 +45,9 @@ The key is never copied to output.
 .PARAMETER AllowUnprotectedFileSystem
 Allow decrypted SQLite files to be staged and published on a filesystem such
 as exFAT/FAT32 that cannot enforce private Windows ACLs. Without this explicit
-acknowledgement, the script fails before creating decrypted data. Prefer an
-NTFS or ReFS destination whenever possible.
+acknowledgement, other destinations fail before creating decrypted data.
+The previously authorized G:/wechat-sqlite-backup destination proceeds without
+repeat confirmation. NTFS/ReFS destinations retain private Windows ACLs.
 
 .EXAMPLE
 ./scripts/backup_wechat_databases.ps1 G:/wechat-sqlite-backup
@@ -98,6 +99,15 @@ function Get-NormalizedFullPath {
         return $Root
     }
     return $Full.TrimEnd('\', '/')
+}
+
+function Test-AutomaticallyAuthorizedBackupDestination {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    # The user has explicitly approved this existing local backup destination.
+    # This does not authorize sibling paths, nested paths, or other drives.
+    $Normalized = Get-NormalizedFullPath -Path $LiteralPath
+    return $Normalized.Equals('G:\wechat-sqlite-backup', [StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-SourceIdentity {
@@ -1048,7 +1058,7 @@ if ($SkipAclProtection) {
         "The decrypted WeChat SQLite files will be readable by anyone who can access this device. " +
         "Use an NTFS/ReFS destination for per-user protection."
     )
-    if (-not $AllowUnprotectedFileSystem) {
+    if (-not $AllowUnprotectedFileSystem -and -not (Test-AutomaticallyAuthorizedBackupDestination $ResolvedOutput)) {
         $CanPrompt = $false
         try {
             $CanPrompt = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected

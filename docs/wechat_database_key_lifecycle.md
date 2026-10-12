@@ -136,7 +136,7 @@ preparation manifest，不会导出或修改 DuckDB，也不会显示“退出�
 不会读取数据目录内的备用配置。它会先加载并验证缓存密钥；若发现加密的
 `BackupFiles/.../Backup.db` 但尚未缓存独立密钥，会在微信仍在线时通过同一套
 ACL 受限、原子更新的 `-SaveKeysOnly` 流程恢复并保存它。密钥准备完成后，若
-检测到微信仍在运行，再提示用户从菜单或托盘彻底退出。随后脚本递归处理中央
+检测到微信仍在运行，直接报错并要求从菜单或托盘彻底退出，不再等待回车确认。随后脚本递归处理中央
 配置中每个账号目录下的所有 `.db` 文件，保留每个账号内的相对路径和完整
 SQLite schema/table 数据，并对每个解密结果执行 `PRAGMA integrity_check`。
 
@@ -160,14 +160,14 @@ SQLite 文件，只重新处理新增或变化的数据库，并从新备份中�
 安全复用所需的源指纹，因此第一次 `-Delta` 会明确提示并执行一次完整刷新，把
 清单升级为 v2；以后才进行增量复用。
 
-exFAT/FAT32 不支持 Windows 私有 ACL。选择这类目标时，交互式运行会先明确警告
-并要求确认；非交互式运行必须显式传入
-`-AllowUnprotectedFileSystem`。确认后，最终清单会记录 ACL 不可用，且任何能够
-访问该设备的人都可能读取明文历史。应优先使用 NTFS/ReFS；确实需要写入 exFAT
-时可运行：
+exFAT/FAT32 不支持 Windows 私有 ACL。已获用户授权的默认目标
+`G:\wechat-sqlite-backup` 无需再次确认，可直接运行上述命令；仍显示文件系统
+提示并在清单中记录 ACL 不可用。其他 exFAT/FAT32 目标继续要求交互确认，
+或在非交互模式使用 `-AllowUnprotectedFileSystem`。NTFS/ReFS 的私有 ACL、
+密钥验证、源稳定性、完整性校验与回滚保持不变。例如显式指定其他目标：
 
 ```powershell
-.\scripts\backup_wechat_databases.ps1 G:\wechat-sqlite-backup `
+.\scripts\backup_wechat_databases.ps1 X:\wechat-sqlite-backup `
     -AllowUnprotectedFileSystem
 ```
 

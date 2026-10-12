@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha1"
@@ -198,7 +197,7 @@ func main() {
 	backupKeyPath := flag.String("backup-key-file", "", "optional file containing a 32-byte BackupFiles key as hexadecimal text")
 	cacheBackupKeyPath := flag.String("cache-backup-key-file", "", "private-staging-only file containing a BackupFiles key to cache in chatlog.json")
 	configuredOnly := flag.Bool("configured-accounts-only", false, "use only accounts from --config (for deterministic diagnostics)")
-	promptExitWeChat := flag.Bool("prompt-exit-wechat", true, "require WeChat to exit before staging (ordinary exports capture live keys first)")
+	promptExitWeChat := flag.Bool("prompt-exit-wechat", true, "noninteractively require WeChat to exit before staging (ordinary exports capture live keys first)")
 	allowPartial := flag.Bool("allow-partial", false, "continue when accounts or databases cannot be exported")
 	saveKeysOnly := flag.Bool("save-keys-only", false, "capture validated database keys and available v4 image keys into chatlog.json without exporting databases")
 	sqliteBackup := flag.Bool("sqlite-backup", false, "strictly back up configured databases as verified, decrypted SQLite files")
@@ -1246,13 +1245,13 @@ func prepare(stage, configPath, backupKey string, baseline baselineIndex, option
 		if len(keyFailures) != 0 && !options.AllowPartial {
 			manifest.Status = "partial"
 			return manifest, fmt.Errorf(
-				"could not capture every required database key before asking WeChat to exit: %s; use chatlog's get key action and rerun",
+				"could not capture every required database key before checking WeChat exit: %s; use chatlog's get key action and rerun",
 				strings.Join(keyFailures, "; "),
 			)
 		}
 		if len(keyFailures) != 0 {
 			manifest.Warnings = append(manifest.Warnings,
-				"Some live account keys could not be captured before the exit prompt: "+strings.Join(keyFailures, "; "))
+				"Some live account keys could not be captured before the exit check: "+strings.Join(keyFailures, "; "))
 		}
 		capturedPIDs := discoveredLivePIDs
 		if options.CentralConfigOnly {
@@ -1861,61 +1860,47 @@ func probeRunningWeChatClientsWith(includeWeixinHelpers bool) ([]runningWeChatCl
 }
 
 func waitForWeChatExit(capturedPIDs map[uint32]bool) error {
-	stdinInfo, stdinErr := os.Stdin.Stat()
-	interactive := stdinErr == nil && stdinInfo.Mode()&os.ModeCharDevice != 0
-	return waitForWeChatExitWith(probeRunningWeChatClients, os.Stdin, os.Stderr, interactive, capturedPIDs)
+	return waitForWeChatExitWith(probeRunningWeChatClients, nil, nil, false, capturedPIDs)
 }
 
 func waitForAllWeChatExit() error {
-	stdinInfo, stdinErr := os.Stdin.Stat()
-	interactive := stdinErr == nil && stdinInfo.Mode()&os.ModeCharDevice != 0
-	return waitForWeChatExitWith(probeAllWeChatClients, os.Stdin, os.Stderr, interactive, nil)
+	return waitForWeChatExitWith(probeAllWeChatClients, nil, nil, false, nil)
 }
 
 func waitForWeChatExitWith(
 	probe func() ([]runningWeChatClient, error),
-	input io.Reader,
-	output io.Writer,
-	interactive bool,
+	_ io.Reader,
+	_ io.Writer,
+	_ bool,
 	capturedPIDs map[uint32]bool,
 ) error {
-	reader := bufio.NewReader(input)
-	for {
-		running, err := probe()
-		if err != nil {
-			return fmt.Errorf("could not recheck whether WeChat is running: %w", err)
-		}
-		if len(running) == 0 {
-			return nil
-		}
-		if capturedPIDs != nil {
-			uncaptured := []string{}
-			for _, client := range running {
-				if !capturedPIDs[client.PID] {
-					uncaptured = append(uncaptured, fmt.Sprintf("%s (PID %d)", client.Name, client.PID))
-				}
-			}
-			if len(uncaptured) != 0 {
-				sort.Strings(uncaptured)
-				return fmt.Errorf(
-					"a WeChat process appeared or could not be associated during live-key capture: %s; exit it completely and rerun the export so its account can be resolved safely",
-					strings.Join(uncaptured, ", "),
-				)
+	running, err := probe()
+	if err != nil {
+		return fmt.Errorf("could not recheck whether WeChat is running: %w", err)
+	}
+	if len(running) == 0 {
+		return nil
+	}
+	if capturedPIDs != nil {
+		uncaptured := []string{}
+		for _, client := range running {
+			if !capturedPIDs[client.PID] {
+				uncaptured = append(uncaptured, fmt.Sprintf("%s (PID %d)", client.Name, client.PID))
 			}
 		}
-
-		labels := runningWeChatClientLabels(running)
-		instruction := "WeChat is still running: " + strings.Join(labels, ", ") + ". " +
-			"Use WeChat's menu or tray icon to exit completely; closing only the window is not enough."
-		fmt.Fprintln(output, instruction)
-		if !interactive {
-			return fmt.Errorf("%s Exit WeChat and rerun the export; interactive prompting is unavailable", instruction)
-		}
-		fmt.Fprint(output, "After WeChat has exited, press Enter to continue (Ctrl+C to cancel): ")
-		if _, err := reader.ReadString('\n'); err != nil {
-			return fmt.Errorf("could not read the WeChat exit prompt: %w", err)
+		if len(uncaptured) != 0 {
+			sort.Strings(uncaptured)
+			return fmt.Errorf(
+				"a WeChat process appeared or could not be associated during live-key capture: %s; exit it completely and rerun the export so its account can be resolved safely",
+				strings.Join(uncaptured, ", "),
+			)
 		}
 	}
+
+	labels := runningWeChatClientLabels(running)
+	instruction := "WeChat is still running: " + strings.Join(labels, ", ") + ". " +
+		"Use WeChat's menu or tray icon to exit completely; closing only the window is not enough."
+	return fmt.Errorf("%s Exit WeChat and rerun the export", instruction)
 }
 
 func runningWeChatClientLabels(running []runningWeChatClient) []string {

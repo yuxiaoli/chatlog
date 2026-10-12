@@ -1892,7 +1892,7 @@ func TestBackupPowerShellDeltaReusesAndReplacesCompleteKeyFreeTree(t *testing.T)
 	assertNoBackupWorkArtifacts(t, root)
 }
 
-func TestBackupPowerShellAclLessFilesystemRequiresAcknowledgementAndSkipsImpossibleAcl(t *testing.T) {
+func TestBackupPowerShellAclLessFilesystemOutsideApprovedDestinationRequiresAcknowledgement(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping PowerShell filesystem-policy subprocess test in short mode")
 	}
@@ -1906,12 +1906,18 @@ func TestBackupPowerShellAclLessFilesystemRequiresAcknowledgementAndSkipsImpossi
 	if aclLessRoot == "" {
 		t.Skip("no ready FAT/exFAT filesystem is available")
 	}
+	targetParent, err := os.Getwd()
+	if err != nil || !strings.EqualFold(filepath.VolumeName(targetParent), filepath.VolumeName(aclLessRoot)) {
+		t.Skip("the test workspace is not on the detected FAT/exFAT volume")
+	}
+	running, err := probeAllWeChatClients()
+	if err != nil || len(running) != 0 {
+		t.Skip("cannot run a synthetic backup while WeChat may be running")
+	}
 
 	fixtureRoot := t.TempDir()
-	dataDir := filepath.Join(fixtureRoot, "empty-account")
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		t.Fatalf("create empty configured account: %v", err)
-	}
+	dataDir := filepath.Join(fixtureRoot, "synthetic-account")
+	createSQLiteBackupFixture(t, filepath.Join(dataDir, "Msg", "MicroMsg.db"))
 	configPath := filepath.Join(fixtureRoot, "chatlog.json")
 	configJSON, err := json.Marshal(storedConfig{History: []storedAccount{{
 		Account:  "acl-less-fixture",
@@ -1926,12 +1932,12 @@ func TestBackupPowerShellAclLessFilesystemRequiresAcknowledgementAndSkipsImpossi
 		t.Fatalf("write ACL-less filesystem config: %v", err)
 	}
 	targetName := ".chatlog-acl-policy-test-" + shortHash(fixtureRoot)
-	outputPath := filepath.Join(aclLessRoot, targetName)
+	outputPath := filepath.Join(targetParent, targetName)
 	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
 		t.Fatalf("ACL-less policy target unexpectedly exists before test: %s", outputPath)
 	}
 	t.Cleanup(func() {
-		if filepath.Dir(outputPath) == filepath.Clean(aclLessRoot) && strings.HasPrefix(filepath.Base(outputPath), ".chatlog-acl-policy-test-") {
+		if filepath.Dir(outputPath) == filepath.Clean(targetParent) && strings.HasPrefix(filepath.Base(outputPath), ".chatlog-acl-policy-test-") {
 			_ = os.RemoveAll(outputPath)
 		}
 	})
@@ -1944,27 +1950,51 @@ func TestBackupPowerShellAclLessFilesystemRequiresAcknowledgementAndSkipsImpossi
 		return command.CombinedOutput()
 	}
 
-	withoutAcknowledgement, withoutErr := run()
-	if withoutErr == nil || !bytes.Contains(withoutAcknowledgement, []byte("-AllowUnprotectedFileSystem")) ||
-		!bytes.Contains(bytes.ToLower(withoutAcknowledgement), []byte("cannot enforce private windows acls")) {
-		t.Fatalf("ACL-less destination did not fail with actionable acknowledgement instructions: err=%v\n%s", withoutErr, withoutAcknowledgement)
+	blocked, blockedErr := run()
+	if blockedErr == nil || !bytes.Contains(blocked, []byte("-AllowUnprotectedFileSystem")) {
+		t.Fatalf("an unrelated ACL-less destination bypassed acknowledgement: err=%v\n%s", blockedErr, blocked)
 	}
 	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("unacknowledged ACL-less run created output: %v", err)
+		t.Fatalf("unacknowledged run created output: %v", err)
 	}
+	for _, extra := range [][]string{{"-AllowUnprotectedFileSystem"}, {"-Delta", "-AllowUnprotectedFileSystem"}} {
+		output, runErr := run(extra...)
+		if runErr != nil {
+			t.Fatalf("explicitly authorized synthetic backup failed: err=%v\n%s", runErr, output)
+		}
+		lowerOutput := bytes.ToLower(output)
+		if !bytes.Contains(lowerOutput, []byte("cannot enforce private windows acls")) || bytes.Contains(lowerOutput, []byte("continue anyway")) {
+			t.Fatalf("expected a warning without an interactive confirmation: %s", output)
+		}
+		manifestBytes, err := os.ReadFile(filepath.Join(outputPath, ".chatlog-sqlite-backup.json"))
+		if err != nil {
+			t.Fatalf("read published synthetic manifest: %v", err)
+		}
+		var manifest map[string]any
+		if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest["filesystem_access_control"] != "unavailable_acknowledged" {
+			t.Fatalf("manifest misreported unavailable ACLs: err=%v access_control=%v", err, manifest["filesystem_access_control"])
+		}
+	}
+}
 
-	acknowledgedOutput, acknowledgedErr := run("-AllowUnprotectedFileSystem")
-	if acknowledgedErr == nil {
-		t.Fatal("empty database fixture unexpectedly completed a backup")
-	}
-	lowerOutput := bytes.ToLower(acknowledgedOutput)
-	if bytes.Contains(lowerOutput, []byte("still inherits permissions")) ||
-		!bytes.Contains(lowerOutput, []byte("cannot enforce private windows acls")) ||
-		!bytes.Contains(lowerOutput, []byte("no database files")) {
-		t.Fatalf("acknowledged ACL-less run did not bypass only the impossible ACL check: err=%v\n%s", acknowledgedErr, acknowledgedOutput)
-	}
-	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("failed acknowledged ACL-less run published output: %v", err)
+func TestBackupPowerShellApprovedDestinationDoesNotRequireRepeatAcknowledgement(t *testing.T) {
+	powerShell, scriptPath := backupPowerShellTestPaths(t)
+	command := `$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile('` + strings.ReplaceAll(scriptPath, "'", "''") + `',[ref]$tokens,[ref]$errors)
+$functions=$ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]},$true)
+foreach ($name in @('Get-NormalizedFullPath','Test-AutomaticallyAuthorizedBackupDestination')) {
+  $definition=$functions | Where-Object Name -eq $name | Select-Object -First 1
+  if ($null -eq $definition) { throw 'Automatic destination policy is missing' }
+  Invoke-Expression $definition.Extent.Text
+}
+foreach ($path in @('G:\wechat-sqlite-backup','g:/WECHAT-SQLITE-BACKUP/')) {
+  if (-not (Test-AutomaticallyAuthorizedBackupDestination $path)) { throw 'Previously authorized destination requested repeat confirmation' }
+}
+foreach ($path in @('C:\wechat-sqlite-backup','G:\wechat-sqlite-backup-other','G:\wechat-sqlite-backup\nested','G:\wechat-sqlite-backup\..\other')) {
+  if (Test-AutomaticallyAuthorizedBackupDestination $path) { throw 'An unrelated destination was automatically authorized' }
+}`
+	output, err := exec.Command(powerShell, "-NoProfile", "-NonInteractive", "-Command", command).CombinedOutput()
+	if err != nil {
+		t.Fatalf("approved destination policy failed: %v\n%s", err, output)
 	}
 }
 
