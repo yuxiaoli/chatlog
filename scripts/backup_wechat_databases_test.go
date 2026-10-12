@@ -1892,7 +1892,7 @@ func TestBackupPowerShellDeltaReusesAndReplacesCompleteKeyFreeTree(t *testing.T)
 	assertNoBackupWorkArtifacts(t, root)
 }
 
-func TestBackupPowerShellAclLessFilesystemOutsideApprovedDestinationRequiresAcknowledgement(t *testing.T) {
+func TestBackupPowerShellAclLessFilesystemContinuesWithoutConfirmation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping PowerShell filesystem-policy subprocess test in short mode")
 	}
@@ -1950,17 +1950,10 @@ func TestBackupPowerShellAclLessFilesystemOutsideApprovedDestinationRequiresAckn
 		return command.CombinedOutput()
 	}
 
-	blocked, blockedErr := run()
-	if blockedErr == nil || !bytes.Contains(blocked, []byte("-AllowUnprotectedFileSystem")) {
-		t.Fatalf("an unrelated ACL-less destination bypassed acknowledgement: err=%v\n%s", blockedErr, blocked)
-	}
-	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("unacknowledged run created output: %v", err)
-	}
-	for _, extra := range [][]string{{"-AllowUnprotectedFileSystem"}, {"-Delta", "-AllowUnprotectedFileSystem"}} {
+	for _, extra := range [][]string{nil, {"-Delta"}, {"-Delta", "-AllowUnprotectedFileSystem"}} {
 		output, runErr := run(extra...)
 		if runErr != nil {
-			t.Fatalf("explicitly authorized synthetic backup failed: err=%v\n%s", runErr, output)
+			t.Fatalf("synthetic backup failed without confirmation: err=%v\n%s", runErr, output)
 		}
 		lowerOutput := bytes.ToLower(output)
 		if !bytes.Contains(lowerOutput, []byte("cannot enforce private windows acls")) || bytes.Contains(lowerOutput, []byte("continue anyway")) {
@@ -1971,30 +1964,9 @@ func TestBackupPowerShellAclLessFilesystemOutsideApprovedDestinationRequiresAckn
 			t.Fatalf("read published synthetic manifest: %v", err)
 		}
 		var manifest map[string]any
-		if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest["filesystem_access_control"] != "unavailable_acknowledged" {
+		if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest["filesystem_access_control"] != "unavailable" {
 			t.Fatalf("manifest misreported unavailable ACLs: err=%v access_control=%v", err, manifest["filesystem_access_control"])
 		}
-	}
-}
-
-func TestBackupPowerShellApprovedDestinationDoesNotRequireRepeatAcknowledgement(t *testing.T) {
-	powerShell, scriptPath := backupPowerShellTestPaths(t)
-	command := `$tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile('` + strings.ReplaceAll(scriptPath, "'", "''") + `',[ref]$tokens,[ref]$errors)
-$functions=$ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]},$true)
-foreach ($name in @('Get-NormalizedFullPath','Test-AutomaticallyAuthorizedBackupDestination')) {
-  $definition=$functions | Where-Object Name -eq $name | Select-Object -First 1
-  if ($null -eq $definition) { throw 'Automatic destination policy is missing' }
-  Invoke-Expression $definition.Extent.Text
-}
-foreach ($path in @('G:\wechat-sqlite-backup','g:/WECHAT-SQLITE-BACKUP/')) {
-  if (-not (Test-AutomaticallyAuthorizedBackupDestination $path)) { throw 'Previously authorized destination requested repeat confirmation' }
-}
-foreach ($path in @('C:\wechat-sqlite-backup','G:\wechat-sqlite-backup-other','G:\wechat-sqlite-backup\nested','G:\wechat-sqlite-backup\..\other')) {
-  if (Test-AutomaticallyAuthorizedBackupDestination $path) { throw 'An unrelated destination was automatically authorized' }
-}`
-	output, err := exec.Command(powerShell, "-NoProfile", "-NonInteractive", "-Command", command).CombinedOutput()
-	if err != nil {
-		t.Fatalf("approved destination policy failed: %v\n%s", err, output)
 	}
 }
 

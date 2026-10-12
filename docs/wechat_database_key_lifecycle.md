@@ -160,15 +160,13 @@ SQLite 文件，只重新处理新增或变化的数据库，并从新备份中�
 安全复用所需的源指纹，因此第一次 `-Delta` 会明确提示并执行一次完整刷新，把
 清单升级为 v2；以后才进行增量复用。
 
-exFAT/FAT32 不支持 Windows 私有 ACL。已获用户授权的默认目标
-`G:\wechat-sqlite-backup` 无需再次确认，可直接运行上述命令；仍显示文件系统
-提示并在清单中记录 ACL 不可用。其他 exFAT/FAT32 目标继续要求交互确认，
-或在非交互模式使用 `-AllowUnprotectedFileSystem`。NTFS/ReFS 的私有 ACL、
-密钥验证、源稳定性、完整性校验与回滚保持不变。例如显式指定其他目标：
+exFAT/FAT32 不支持 Windows 私有 ACL。所有这类目标现在直接继续，解密前不再
+要求交互确认或额外开关；仍显示文件系统提示并在清单中记录 ACL 不可用。
+`-AllowUnprotectedFileSystem` 仅保留旧命令兼容。NTFS/ReFS 的私有 ACL、
+密钥验证、源稳定性、完整性校验与回滚保持不变。例如指定其他目标：
 
 ```powershell
-.\scripts\backup_wechat_databases.ps1 X:\wechat-sqlite-backup `
-    -AllowUnprotectedFileSystem
+.\scripts\backup_wechat_databases.ps1 X:\wechat-sqlite-backup
 ```
 
 如果不希望使用或更新中央缓存，也可以显式提供独立密钥。显式文件具有最高

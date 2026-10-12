@@ -43,11 +43,9 @@ the script attempts to capture and cache the key while WeChat is still running.
 The key is never copied to output.
 
 .PARAMETER AllowUnprotectedFileSystem
-Allow decrypted SQLite files to be staged and published on a filesystem such
-as exFAT/FAT32 that cannot enforce private Windows ACLs. Without this explicit
-acknowledgement, other destinations fail before creating decrypted data.
-The previously authorized G:/wechat-sqlite-backup destination proceeds without
-repeat confirmation. NTFS/ReFS destinations retain private Windows ACLs.
+Compatibility option, accepted but no longer required. All exFAT/FAT32
+destinations proceed without confirmation and record unavailable ACL protection
+in the manifest. NTFS/ReFS destinations retain private Windows ACLs.
 
 .EXAMPLE
 ./scripts/backup_wechat_databases.ps1 G:/wechat-sqlite-backup
@@ -99,15 +97,6 @@ function Get-NormalizedFullPath {
         return $Root
     }
     return $Full.TrimEnd('\', '/')
-}
-
-function Test-AutomaticallyAuthorizedBackupDestination {
-    param([Parameter(Mandatory = $true)][string]$LiteralPath)
-
-    # The user has explicitly approved this existing local backup destination.
-    # This does not authorize sibling paths, nested paths, or other drives.
-    $Normalized = Get-NormalizedFullPath -Path $LiteralPath
-    return $Normalized.Equals('G:\wechat-sqlite-backup', [StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-SourceIdentity {
@@ -1048,7 +1037,7 @@ try {
 $AclLessFileSystems = @("exfat", "fat", "fat32")
 $SkipAclProtection = $AclLessFileSystems -contains $DestinationFileSystem.ToLowerInvariant()
 $FileSystemAccessControl = if ($SkipAclProtection) {
-    "unavailable_acknowledged"
+    "unavailable"
 } else {
     "private_windows_acl"
 }
@@ -1058,34 +1047,6 @@ if ($SkipAclProtection) {
         "The decrypted WeChat SQLite files will be readable by anyone who can access this device. " +
         "Use an NTFS/ReFS destination for per-user protection."
     )
-    if (-not $AllowUnprotectedFileSystem -and -not (Test-AutomaticallyAuthorizedBackupDestination $ResolvedOutput)) {
-        $CanPrompt = $false
-        try {
-            $CanPrompt = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
-        } catch {
-            $CanPrompt = $false
-        }
-        if (-not $CanPrompt) {
-            throw "$AclWarning Rerun with -AllowUnprotectedFileSystem to acknowledge this in a non-interactive session."
-        }
-        try {
-            $Choices = [Management.Automation.Host.ChoiceDescription[]]@(
-                [Management.Automation.Host.ChoiceDescription]::new("&Yes", "Create unprotected plaintext SQLite files."),
-                [Management.Automation.Host.ChoiceDescription]::new("&No", "Cancel without creating decrypted data.")
-            )
-            $Choice = $Host.UI.PromptForChoice(
-                "Unprotected plaintext backup",
-                "$AclWarning Continue anyway?",
-                $Choices,
-                1
-            )
-        } catch {
-            throw "$AclWarning Rerun with -AllowUnprotectedFileSystem to acknowledge it explicitly."
-        }
-        if ($Choice -ne 0) {
-            throw "Backup cancelled before any decrypted data was created."
-        }
-    }
     Write-Warning $AclWarning
 }
 
