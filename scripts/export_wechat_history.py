@@ -35,6 +35,7 @@ import shutil
 import sqlite3
 import sys
 import uuid
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2929,12 +2930,33 @@ def phone_backup_auxiliary_sha256(directory: Path) -> str:
     return digest.hexdigest()
 
 
+def phone_import_progress(phase: str, started: float, **counts: Any) -> None:
+    print(json.dumps({'event':'wechat-build-progress','time':datetime.now(timezone.utc).isoformat(),
+        'phase':phase,'elapsed_seconds':round(time.monotonic()-started,3),**counts}),file=sys.stderr,flush=True)
+
+
 def import_phone_backup_messages(
     duck: duckdb.DuckDBPyConnection,
     databases: Sequence[DatabaseSpec],
     backup_key: bytes | None,
     allow_partial: bool,
+    *,
+    staging_commit_bytes: int = 0,
+    staging_checkpoint_bytes: int = 0,
 ) -> int:
+    # Chunk commits are valid only in an unpublished disposable staging database.
+    # The caller must discard it on any exception; legacy/delta atomicity stays unchanged.
+    if type(staging_commit_bytes) is not int or staging_commit_bytes < 0:
+        raise ValueError("staging_commit_bytes must be a nonnegative integer")
+    if staging_commit_bytes and allow_partial:
+        raise ValueError("chunked staging phone import forbids partial export")
+    if type(staging_checkpoint_bytes) is not int or staging_checkpoint_bytes < 0:
+        raise ValueError("staging_checkpoint_bytes must be a nonnegative integer")
+    if staging_checkpoint_bytes and (not staging_commit_bytes or staging_checkpoint_bytes < staging_commit_bytes):
+        raise ValueError("checkpoint budget requires bounded staging commits and cannot be smaller")
+    if staging_checkpoint_bytes:
+        # Automatic checkpoints must share the budget; DuckDB defaults to only 16 MiB.
+        duck.execute(f"SET checkpoint_threshold='{staging_checkpoint_bytes}B'")
     create_backup_message_tables(duck)
     backup_databases = [
         database
@@ -2989,7 +3011,9 @@ def import_phone_backup_messages(
         source_index = Path(database.source_path).resolve()
         bundle_root = source_index.parent
         database_record_count = 0
+        started = time.monotonic()
         try:
+            phone_import_progress('phone_fingerprint_before', started, status='started')
             auxiliary_before = phone_backup_auxiliary_sha256(bundle_root)
             if (
                 database.auxiliary_sha256
@@ -3000,7 +3024,14 @@ def import_phone_backup_messages(
                 )
             duck.execute("BEGIN TRANSACTION")
             catalog_backup_archive_files(duck, database, bundle_root)
+            total_segments = duck.execute("SELECT coalesce(sum(indexed_segments),0) FROM chatlog.backup_archive_files WHERE database_id=? AND payload_kind='text'",[database.database_id]).fetchone()[0]
+            processed_segments = 0
+            phone_import_progress('phone_segments',started,processed_segments=0,total_segments=total_segments)
             rows: list[tuple[Any, ...]] = []
+            batch_bytes = 0
+            transaction_bytes = 0
+            checkpoint_bytes = 0
+            batch_byte_limit = min(staging_commit_bytes, 8 * 1024 * 1024) if staging_commit_bytes else 0
             for segment in iter_backup_segments(
                 database.staged_path, bundle_root, backup_key[:16]
             ):
@@ -3038,6 +3069,8 @@ def import_phone_backup_messages(
                         _hash_text(segment.plaintext_sha256),
                     ],
                 )
+                processed_segments += 1
+                transaction_bytes += len(segment.root_value)
                 for message in segment.messages:
                     source_message_key = (
                         f"{database.database_id}:MsgSegments:{segment.index_rowid}:"
@@ -3064,7 +3097,10 @@ def import_phone_backup_messages(
                             message.raw_record,
                         )
                     )
-                    if len(rows) >= BACKUP_MESSAGE_BATCH_SIZE:
+                    row_bytes = len(message.raw_record) + len((message.content or '').encode('utf-8')) + 1024
+                    batch_bytes += row_bytes
+                    transaction_bytes += row_bytes
+                    if len(rows) >= BACKUP_MESSAGE_BATCH_SIZE or (batch_byte_limit and batch_bytes >= batch_byte_limit):
                         insert_batch(
                             duck,
                             f"{quote_ident(CHATLOG_SCHEMA)}.backup_message_records",
@@ -3073,6 +3109,26 @@ def import_phone_backup_messages(
                         )
                         database_record_count += len(rows)
                         rows.clear()
+                        batch_bytes = 0
+                if staging_commit_bytes and transaction_bytes >= staging_commit_bytes:
+                    if rows:
+                        insert_batch(duck, f"{quote_ident(CHATLOG_SCHEMA)}.backup_message_records", rows, record_columns)
+                        database_record_count += len(rows)
+                        rows.clear()
+                        batch_bytes = 0
+                    checkpoint_started = time.monotonic()
+                    phone_import_progress('phone_commit',started,status='started',processed_segments=processed_segments,total_segments=total_segments,records=database_record_count)
+                    duck.execute("COMMIT")
+                    committed = time.monotonic()
+                    checkpoint_bytes += transaction_bytes
+                    phone_import_progress('phone_commit',started,status='completed',commit_seconds=round(committed-checkpoint_started,3),processed_segments=processed_segments,total_segments=total_segments)
+                    if not staging_checkpoint_bytes or checkpoint_bytes >= staging_checkpoint_bytes:
+                        phone_import_progress('phone_checkpoint',started,status='started',processed_segments=processed_segments,total_segments=total_segments)
+                        duck.execute("CHECKPOINT")
+                        phone_import_progress('phone_checkpoint',started,status='completed',checkpoint_seconds=round(time.monotonic()-committed,3),processed_segments=processed_segments,total_segments=total_segments,records=database_record_count)
+                        checkpoint_bytes = 0
+                    duck.execute("BEGIN TRANSACTION")
+                    transaction_bytes = 0
             if rows:
                 insert_batch(
                     duck,
@@ -3081,13 +3137,20 @@ def import_phone_backup_messages(
                     record_columns,
                 )
                 database_record_count += len(rows)
+            phone_import_progress('phone_fingerprint_after',started,status='started',processed_segments=processed_segments,total_segments=total_segments,records=database_record_count)
             auxiliary_after = phone_backup_auxiliary_sha256(bundle_root)
             if auxiliary_after != auxiliary_before:
                 raise ExportError(
                     "phone-backup archives changed while messages were being imported"
                 )
             duck.execute("COMMIT")
+            if staging_checkpoint_bytes:
+                checkpoint_started = time.monotonic()
+                phone_import_progress('phone_checkpoint',started,status='started',processed_segments=processed_segments,total_segments=total_segments)
+                duck.execute("CHECKPOINT")
+                phone_import_progress('phone_checkpoint',started,status='completed',checkpoint_seconds=round(time.monotonic()-checkpoint_started,3),processed_segments=processed_segments,total_segments=total_segments,records=database_record_count)
             imported_records += database_record_count
+            phone_import_progress('phone_import',started,status='completed',processed_segments=processed_segments,total_segments=total_segments,records=database_record_count)
         except (
             BackupArchiveError,
             OSError,
